@@ -49,3 +49,26 @@ Remote publication verified on 2026-10-14:
 - [Draft PR #1](https://github.com/tt-asahara/aidlc-ui-poc-a/pull/1) proposes feature/ui-poc-foundation into main, without a merge.
 - GitHub Actions reported 0 workflow runs and 0 check runs for that exact commit; the commit-status API returned no statuses. This records absence of CI results, not a passed CI claim.
 - The separate documentation checkpoint containing this record keeps the shared plugin code unchanged. Future implementation increments should rerun relevant tests before pushing and verify the exact remote commit afterward.
+
+
+
+## 2026-10-14 — Complete upstream baseline and runtime preflight
+
+This later checkpoint supersedes the earlier selected-source availability limitation. It does not import upstream history into A or report a successful live workflow.
+
+- Obtained a complete, non-shallow checkout of official [AI-DLC v2.11.0](https://github.com/awslabs/aidlc-workflows/tree/6a378b53c0a4fe0641ed7d8de8dfff94264d5b6a): commit `6a378b53c0a4fe0641ed7d8de8dfff94264d5b6a`, tree `6697c147c055206ac67ca69c91da83c53b2b0cb2`, annotated tag object `4079edbea52cf4d3c80e580825da3a4dd8213271`.
+- Verified 1,130 reachable commits (including HEAD), 1,673 tracked files, no submodule entries, and a clean working tree. `git fsck --full --no-reflogs` completed successfully; `git rev-parse --is-shallow-repository` returned `false`. The complete baseline remains separate from this scaffold.
+- Repeated the source-contract check against the complete pinned source: 23 contribution targets/anchors and all 1,673 source blob identities passed, with projected runtime documentation/config copies matching. Earlier entries accurately record the initial 30-file subset check. Neither check substitutes for the official validator or composer.
+- The unchanged checker suite again passed 35 tests, with 0 failures and 0 skipped tests. This update changes documentation only.
+
+### Official validator runtime blocker
+
+- Bun is absent, so the official plugin validator could not complete. A Node v24.19.0 attempt failed with `ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX` on a TypeScript constructor parameter property. A second attempt using `--experimental-transform-types` progressed further but failed with `ERR_UNSUPPORTED_ESM_URL_SCHEME` for the Bun-specific `bun:` import. These are blocked runtime attempts, not a plugin-validation result.
+- Bun 1.4.2 matches the pinned upstream [primary CI workflow](https://github.com/awslabs/aidlc-workflows/blob/6a378b53c0a4fe0641ed7d8de8dfff94264d5b6a/.github/workflows/ci.yml). Its [official release metadata](https://github.com/oven-sh/bun/releases/tag/bun-v1.4.2) was inspected; the binary has not been downloaded, verified, or installed.
+- A dedicated cloud runtime is requested but not yet available. Official validation/build/compose and subsequent integration checks remain pending there.
+
+### Baseline publication blocker
+
+- B/C remain unmodified. Their pristine official baseline must be pushed before separate feature-branch changes so upstream-versus-treatment changes remain reviewable.
+- An authenticated Git transport is not yet configured for the full-history push. Standard GitHub CLI OAuth requests broader scope than this narrow operation, and safe credential storage is unverified; no login flow was started.
+- Next: establish a suitable authenticated transport and dedicated runtime, verify pristine B/C remote commits/trees first, then create focused feature branches and draft PRs for treatment changes. No merge or successful live A/B/C execution is claimed.
