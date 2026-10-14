@@ -1,0 +1,43 @@
+{
+  "schema": 1,
+  "id": "jp-mobile-member-benefits-v1",
+  "locale": "ja-JP",
+  "target": {
+    "form_factor": "mobile-web",
+    "viewports": [
+      {"width": 390, "height": 844},
+      {"width": 360, "height": 800}
+    ]
+  },
+  "constraints": {
+    "synthetic_data_only": true,
+    "real_ponta_api": false,
+    "authentication": false,
+    "payment": false,
+    "remote_runtime_dependencies": false,
+    "integrated_ui_units": 1
+  },
+  "brief": "架空の会員向け特典アプリ。利用者は保有ポイント、今月失効予定ポイント、利用可能な特典を確認し、特典詳細から交換内容を確認できる。ブランド名・会員番号・店舗・ポイント値はすべて合成データとする。",
+  "screens": [
+    {"id": "SCREEN-HOME", "purpose": "ポイント残高とおすすめ特典の概要"},
+    {"id": "SCREEN-BENEFITS", "purpose": "カテゴリと必要ポイントで絞り込める特典一覧"},
+    {"id": "SCREEN-BENEFIT-DETAIL", "purpose": "特典条件と交換前確認"}
+  ],
+  "required_mappings": [
+    {"screen": "SCREEN-HOME", "state": "STATE-LOADING", "ac": "AC-001", "expectation": "スケルトン表示中も主要領域名を認識できる"},
+    {"screen": "SCREEN-HOME", "state": "STATE-SUCCESS", "ac": "AC-002", "expectation": "残高12,480ポイントと失効予定320ポイントを区別して表示する"},
+    {"screen": "SCREEN-HOME", "state": "STATE-ERROR", "ac": "AC-003", "expectation": "再読み込み操作と説明を表示する"},
+    {"screen": "SCREEN-BENEFITS", "state": "STATE-SUCCESS", "ac": "AC-004", "expectation": "合成特典を最低6件表示し必要ポイントを比較できる"},
+    {"screen": "SCREEN-BENEFITS", "state": "STATE-EMPTY", "ac": "AC-005", "expectation": "絞り込み解除操作を含む空状態を表示する"},
+    {"screen": "SCREEN-BENEFITS", "state": "STATE-RECOVERY", "ac": "AC-006", "expectation": "絞り込み解除後に一覧へ復帰する"},
+    {"screen": "SCREEN-BENEFIT-DETAIL", "state": "STATE-SUCCESS", "ac": "AC-007", "expectation": "必要ポイント、期限、利用条件、戻る操作を表示する"},
+    {"screen": "SCREEN-BENEFIT-DETAIL", "state": "STATE-INSUFFICIENT", "ac": "AC-008", "expectation": "残高不足を説明し交換確定操作を無効化する"}
+  ],
+  "synthetic_data": {
+    "member_name": "山田 はるか",
+    "masked_member_id": "0000-1234-****",
+    "balance": 12480,
+    "expiring_this_month": 320,
+    "benefit_categories": ["グルメ", "レジャー", "ショッピング"]
+  }
+}

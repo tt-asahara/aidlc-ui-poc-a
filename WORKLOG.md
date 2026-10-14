@@ -109,3 +109,25 @@ This later checkpoint supersedes the earlier selected-source availability limita
   validation/build/compose and live model-backed execution remain not run;
   Bun was not installed and Codex authentication/runtime settings were not
   changed.
+
+
+## 2026-10-14 — Bun validation and cloud-task experiment preparation
+
+- Installed the official Bun 1.4.2 Linux x64 release under the writable cloud
+  workspace after explicit approval. Verified 36,646,985 bytes and SHA-256
+  `36368faef7527875d5ffa52e53cd48021741f2a83eb6208a8dd64068d422a913`.
+  No shell profile, system, security, or authentication setting changed.
+- Corrected the plugin scope's empty keyword list, which official v2.11.0
+  validation rejects. A/B/C received the same plugin change.
+- Official authoring validation, Claude projection build and disposable compose
+  passed; graph compilation found `ui-poc-comparison`, compose had no drops,
+  and its second pass was idempotent. Package determinism and the 35 local
+  evidence tests passed.
+- Reproduced the official Codex compose mismatch and one official integration
+  control failure documented in `poc/experiment/VERIFICATION.md`. Neither
+  official core nor composer was modified, and no CLI bypass was attempted.
+- Added the exact pinned Anthropic frontend-design payload to A. A remains an
+  Anthropic-only treatment; no Matt or Impeccable payload was added.
+- Added a frozen synthetic Japanese mobile member-benefits fixture and a
+  cloud-task runbook. No real Ponta API, authentication, payment, customer data,
+  host heartbeat, role identity, approval, or audit event is supplied.
