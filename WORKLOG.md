@@ -39,4 +39,13 @@ See [verification.md](poc/ui-poc/docs/verification.md) and [contract.md](poc/ui-
 
 ### Version-control checkpoint
 
-A was bootstrapped on main with README commit [3c8c0c5237de5dda77489e6a83de2fb32d78a51c](https://github.com/tt-asahara/aidlc-ui-poc-a/commit/3c8c0c5237de5dda77489e6a83de2fb32d78a51c), and its remote main ref was verified. That commit is a repository bootstrap, not a pristine upstream fork. This integration scaffold is published on feature/ui-poc-foundation for a draft pull request, retaining main unchanged. B/C have not been modified; their pristine upstream base must be recorded before treatment changes. No CI workflow, package lifecycle hook, installation, or automatic deployment is added. Exact scaffold remote verification will be recorded after publication.
+A was bootstrapped on main with README commit [3c8c0c5237de5dda77489e6a83de2fb32d78a51c](https://github.com/tt-asahara/aidlc-ui-poc-a/commit/3c8c0c5237de5dda77489e6a83de2fb32d78a51c), and its remote main ref was verified. That commit is a repository bootstrap, not a pristine upstream fork. This integration scaffold is published on feature/ui-poc-foundation for a draft pull request, retaining main unchanged. B/C have not been modified; their pristine upstream base must be recorded before treatment changes. No CI workflow, package lifecycle hook, installation, or automatic deployment is added. 
+
+Remote publication verified on 2026-10-14:
+
+- Scaffold commit: [d8e9d48c7804fd6a3b27c751c5f9b48eae7485f2](https://github.com/tt-asahara/aidlc-ui-poc-a/commit/d8e9d48c7804fd6a3b27c751c5f9b48eae7485f2).
+- Its parent is README bootstrap 3c8c0c5237de5dda77489e6a83de2fb32d78a51c; its Git tree is 288c60e140e522280de04feea1d4a01f3b39f3cb.
+- The remote feature branch points to that scaffold commit. The recursive remote tree is complete; all 47 file blob hashes match the tested local snapshot.
+- [Draft PR #1](https://github.com/tt-asahara/aidlc-ui-poc-a/pull/1) proposes feature/ui-poc-foundation into main, without a merge.
+- GitHub Actions reported 0 workflow runs and 0 check runs for that exact commit; the commit-status API returned no statuses. This records absence of CI results, not a passed CI claim.
+- The separate documentation checkpoint containing this record keeps the shared plugin code unchanged. Future implementation increments should rerun relevant tests before pushing and verify the exact remote commit afterward.
