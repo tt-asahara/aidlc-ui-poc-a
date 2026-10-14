@@ -1,0 +1,8 @@
+{
+  "schema": 1,
+  "arm": "A",
+  "treatment_config": "ui-poc/treatments/a.json",
+  "runtime_treatment_config": "ui-poc/tools/ui-poc/treatments/a.json",
+  "source_lock": "ui-poc/treatments/source-lock.json",
+  "status": "initial-integration-scaffold; runtime-not-installed; stage-invocation-not-run"
+}
