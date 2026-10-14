@@ -131,3 +131,21 @@ This later checkpoint supersedes the earlier selected-source availability limita
 - Added a frozen synthetic Japanese mobile member-benefits fixture and a
   cloud-task runbook. No real Ponta API, authentication, payment, customer data,
   host heartbeat, role identity, approval, or audit event is supplied.
+
+
+## 2026-10-14 — Issue #6 formal workflow startup probe
+
+- Reconfirmed the existing cloud environment, then created an isolated `/tmp`
+  project from the official v2.11.0 Claude projection. Composed the validated
+  UI plugin and confirmed graph compilation and the `ui-poc-comparison` scope.
+- Official deterministic intent creation completed Initialization and selected
+  the required strict controls. The first `orchestrate next` did not return a
+  stage execution directive because the cloud task is not a Claude host and no
+  lifecycle hooks had executed.
+- Read-only doctor confirmed intact registrations but zero hook execution, zero
+  human-turn receipts and no runtime graph. No hook, approval, heartbeat or
+  audit record was synthesized; no setting, authentication or security control
+  was changed.
+- Full commands, expected/actual behavior and the Issue #6/#7/#8 impact are in
+  `poc/experiment/FORMAL-WORKFLOW-PROBE.md`. No framework or plugin code change
+  was indicated by this probe.
