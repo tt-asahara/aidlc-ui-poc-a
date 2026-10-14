@@ -1,0 +1,339 @@
+// covers: hook:aidlc-session-end, function:appendAuditEntry
+//
+// t30 — aidlc-session-end.ts SessionEnd hook behaviour. Migrated from
+// tests/unit/t30-hook-session-end.sh (TAP plan 7). Mechanism: cli.
+//
+// WHY CLI (process-boundary, not in-process): the SUBJECT is a hook, not a
+// pure function. aidlc-session-end.ts (dist/claude/.claude/hooks/) runs at
+// module top level on import and TERMINATES the process:
+//   :19  projectDir = resolveProjectDirFromHook(import.meta.url)
+//   :22  if (!existsSync(stateFilePath(projectDir))) process.exit(0)
+//          — the "no active workflow" no-op gate (no heartbeat, no audit)
+//   :25-27 mkdir aidlc-docs/.aidlc-engine/hooks-health + write session-end.last
+//          heartbeat (only reached when state IS present)
+//   :32-45 reason defaults to "unknown"; if stdin is not a TTY it reads
+//          Bun.stdin.text(), JSON.parses it, and pulls raw.reason when the
+//          payload is a valid Claude Code hook input — malformed / empty /
+//          no-reason stdin leaves reason === "unknown" (the catch swallows)
+//   :47-52 appendAuditEntry("SESSION_ENDED", { Reason: reason }, projectDir)
+//          — writes a "**Event**: SESSION_ENDED" block to audit.md, with a
+//          "**Reason**: <reason>" field; on emit failure recordHookDrop + exit 0
+// None of those seams — stdin, the env/script-path projectDir derivation, the
+// exit(0) no-op gate, the heartbeat write — is reachable by importing a
+// function; the module's top level RUNS on import. So this twin SPAWNS the real
+// shipped hook the same way Claude Code's SessionEnd drives it from
+// settings.json: `Bun.spawnSync({ cmd: [BUN, HOOK], stdin: <json bytes>,
+// env: {…CLAUDE_PROJECT_DIR} })`. Same pattern as t07 (audit-logger hook twin).
+//
+// appendAuditEntry's on-disk block format (aidlc-audit.ts): the SESSION_ENDED
+// event maps to the "## Session End" heading and renders each field as a
+// "**<key>**: <value>" line — so { Reason: "logout" } becomes
+// "**Reason**: logout". Asserted below against the real bytes on disk.
+//
+// FIXTURE DISCIPLINE (mirrors the .sh's create_test_project + seed_state_file +
+// seed_audit_file + cleanup_test_project, one fresh project per case):
+//   - createTestProject() -> a fresh temp dir with aidlc-docs/.
+//   - seedStateFile(proj, state-mid-ideation.md) -> the canonical "active
+//     workflow" signal the hook gates on (MID_IDEATION in the .sh, the same
+//     fixture bytes).
+//   - seedAuditFile() -> copies tests/fixtures/audit-sample.md to
+//     aidlc-docs/audit.md (the precondition for the emit; appendAuditEntry
+//     appends to it).
+//   - cleanupTestProject() rm -rf's each temp project. Nothing written under
+//     tests/fixtures/**.
+//
+// Old TAP -> new test parity (1:1, every .sh assertion -> a named test()):
+//   .sh test 1 (emits SESSION_ENDED w/ active workflow) -> "emits SESSION_ENDED when an active workflow exists"
+//   .sh test 2 (records reason field)                   -> "records the reason field as **Reason**: <value>"
+//   .sh test 3 (no-op when state absent)                -> "no-op when state file absent (audit unchanged)"
+//   .sh test 4 (writes heartbeat w/ active workflow)    -> "writes the session-end.last heartbeat when active workflow exists"
+//   .sh test 5 (empty stdin graceful, exit 0)           -> "handles empty stdin gracefully (exit 0)"
+//   .sh test 6 (defaults reason to 'unknown')           -> "defaults reason to 'unknown' on empty/no stdin"
+//   .sh test 7 (no heartbeat when state absent)         -> "no heartbeat when state file absent"
+//
+// 7 .sh asserts -> 7 expect()-bearing test() cases (several STRONGER: test 1
+// pins the canonical start-of-line **Event**: line; test 2 pins the **Reason**
+// value co-located on the SESSION_ENDED block; test 3 asserts byte-equality of
+// audit.md, not just unchanged line count; test 5 also asserts the emit still
+// landed; test 6 asserts the reason is exactly "unknown").
+
+import {
+  NATIVE_FIXTURE_SETUP_TIMEOUT_MS,
+  NATIVE_STARTUP_TIMEOUT_MS,
+  remainingOperationTimeoutMs,
+} from "../harness/test-budget.ts";
+import { afterEach, beforeEach, describe, expect, test, setDefaultTimeout } from "bun:test";
+import { copyFileSync, existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+  AIDLC_SRC,
+  cleanupTestProject,
+  createTestProject,
+  FIXTURES_DIR,
+  seedAuditFile,
+  seededAuditDir,
+  seededRecordDir,
+  seededStateFile,
+  seedStateFile,
+} from "../harness/fixtures.ts";
+import {
+  createIntent,
+  setActiveIntentCursor,
+  writeSessionBinding,
+  writeSessionIntentUuid,
+} from "../../core/tools/aidlc-lib.ts";
+
+setDefaultTimeout(NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+const BUN = process.execPath; // the bun running this test
+const HOOK = join(AIDLC_SRC, "hooks", "aidlc-session-end.ts");
+const MID_IDEATION = join(FIXTURES_DIR, "state-mid-ideation.md");
+
+let proj: string;
+
+// P9 per-intent layout: state + heartbeat re-root under the default intent's
+// record; the audit trail is a DIR of per-clone shards (read via the glob).
+// session-end's appendAuditEntry CREATES its own shard if missing (no
+// audit-existence gate), so no shard needs pre-seeding — seedAuditFile only
+// supplies a (here irrelevant) baseline.
+function statePath(p: string): string {
+  return seededStateFile(p);
+}
+
+function readAudit(p: string): string {
+  const auditDir = seededAuditDir(p);
+  let names: string[];
+  try {
+    names = readdirSync(auditDir);
+  } catch {
+    return "";
+  }
+  return names
+    .filter((n) => n.endsWith(".md"))
+    .sort()
+    .map((n) => readFileSync(join(auditDir, n), "utf-8"))
+    .join("\n");
+}
+
+function heartbeatPath(p: string): string {
+  return join(seededRecordDir(p), ".aidlc-engine/hooks-health", "session-end.last");
+}
+
+function auditOf(recordDir: string): string {
+  try {
+    return readdirSync(join(recordDir, "audit")).map((n) => readFileSync(join(recordDir, "audit", n), "utf-8")).join("");
+  } catch {
+    return "";
+  }
+}
+
+interface FireResult {
+  exitCode: number;
+}
+
+/**
+ * Fire the real session-end hook once with the given SessionEnd JSON on stdin,
+ * mirroring the .sh's `echo '<json>' | CLAUDE_PROJECT_DIR=$PROJ bun $HOOK`.
+ * Piping bytes makes stdin non-TTY, so the hook's `!process.stdin.isTTY`
+ * branch reads + parses the payload — exactly how Claude Code drives it.
+ * Returns the exit code.
+ */
+function fire(json: string, p: string): FireResult {
+  const r = Bun.spawnSync({
+    timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+    cmd: [BUN, HOOK],
+    stdin: new TextEncoder().encode(json),
+    stdout: "ignore",
+    stderr: "ignore",
+    env: { ...process.env, CLAUDE_PROJECT_DIR: p },
+  });
+  return { exitCode: r.exitCode };
+}
+
+describe("t30 session-end SessionEnd hook (mechanism cli — spawned hook + stdin seam)", () => {
+  beforeEach(() => {
+    proj = createTestProject();
+  });
+
+  afterEach(() => {
+    cleanupTestProject(proj);
+  });
+
+  test("emits SESSION_ENDED when an active workflow exists [.sh test 1]", () => {
+    seedStateFile(proj, MID_IDEATION);
+    seedAuditFile(proj);
+    fire('{"reason":"logout"}', proj);
+    const body = readAudit(proj);
+    // .sh grepped "SESSION_ENDED"; STRONGER — pin the canonical start-of-line
+    // **Event**: SESSION_ENDED field the appendAuditEntry formatter writes.
+    expect(body).toContain("SESSION_ENDED");
+    const hasCanonical = body
+      .split("\n")
+      .some((l) => l.trim() === "**Event**: SESSION_ENDED");
+    expect(hasCanonical).toBe(true);
+  });
+
+  test("records the reason field as **Reason**: <value> [.sh test 2]", () => {
+    seedStateFile(proj, MID_IDEATION);
+    seedAuditFile(proj);
+    fire('{"reason":"logout"}', proj);
+    const body = readAudit(proj);
+    // .sh grepped `\*\*Reason\*\*: logout`. STRONGER — assert the **Reason**
+    // line is co-located inside the SESSION_ENDED block (the field follows the
+    // **Event**: SESSION_ENDED line of the same appended entry).
+    expect(body).toContain("**Reason**: logout");
+    const idxEvent = body.indexOf("**Event**: SESSION_ENDED");
+    const idxReason = body.indexOf("**Reason**: logout");
+    expect(idxEvent).toBeGreaterThanOrEqual(0);
+    expect(idxReason).toBeGreaterThan(idxEvent);
+  });
+
+  test("no-op when state file absent (audit unchanged) [.sh test 3]", () => {
+    // createTestProject made no state file, so the hook hits its :22 no-op gate
+    // and exits 0 before any heartbeat or audit write — the same precondition
+    // the .sh set up by `rm -f aidlc-state.md`.
+    expect(existsSync(statePath(proj))).toBe(false);
+    seedAuditFile(proj);
+    const before = readAudit(proj);
+    const r = fire('{"reason":"logout"}', proj);
+    // .sh compared line counts; STRONGER — assert byte-equality of audit.md.
+    expect(r.exitCode).toBe(0);
+    expect(readAudit(proj)).toBe(before);
+  });
+
+  test("writes the session-end.last heartbeat when active workflow exists [.sh test 4]", () => {
+    seedStateFile(proj, MID_IDEATION);
+    seedAuditFile(proj);
+    expect(existsSync(heartbeatPath(proj))).toBe(false);
+    fire('{"reason":"logout"}', proj);
+    expect(existsSync(heartbeatPath(proj))).toBe(true);
+  });
+
+  test("handles empty stdin gracefully (exit 0) [.sh test 5]", () => {
+    seedStateFile(proj, MID_IDEATION);
+    seedAuditFile(proj);
+    // .sh piped `echo ""` (a lone newline) — non-TTY, so the hook reads stdin,
+    // JSON.parse throws, the catch swallows it, and the emit still lands.
+    const r = fire("\n", proj);
+    expect(r.exitCode).toBe(0);
+    // STRONGER than the .sh (which only checked rc): the emit still fired.
+    expect(readAudit(proj)).toContain("SESSION_ENDED");
+  });
+
+  test("defaults reason to 'unknown' on empty/no stdin [.sh test 6]", () => {
+    seedStateFile(proj, MID_IDEATION);
+    seedAuditFile(proj);
+    fire("\n", proj);
+    const body = readAudit(proj);
+    // .sh grepped `\*\*Reason\*\*: unknown`. The parse failed on the lone
+    // newline so reason kept its "unknown" default (:32).
+    expect(body).toContain("**Reason**: unknown");
+    // STRONGER: confirm it did NOT carry a "logout"-style reason from elsewhere.
+    expect(body).not.toContain("**Reason**: logout");
+  });
+
+  test("no heartbeat when state file absent [.sh test 7]", () => {
+    // No state file (createTestProject seeds none), and no audit.md either —
+    // the hook's :22 gate fires before mkdir/heartbeat. Mirrors the .sh's
+    // rm -f state + rm -rf .aidlc-engine/hooks-health precondition.
+    expect(existsSync(statePath(proj))).toBe(false);
+    fire('{"reason":"logout"}', proj);
+    expect(existsSync(heartbeatPath(proj))).toBe(false);
+  });
+
+  test("a failed append is recorded under the session's stamped intent, not the cursor's", () => {
+    const ended = createIntent(proj, "ended-work", "default", "feature");
+    const other = createIntent(proj, "other-work", "default", "feature");
+    const record = (dirName: string) => join(proj, "aidlc", "spaces", "default", "intents", dirName);
+    for (const intent of [ended, other]) copyFileSync(MID_IDEATION, join(record(intent.dirName), "aidlc-state.md"));
+    writeSessionIntentUuid(proj, "session-ended", ended.uuid);
+    writeSessionBinding(proj, "session-ended", "default", ended.dirName, "switch");
+    setActiveIntentCursor(proj, other.dirName, "default");
+    // The ended intent's audit directory is a regular file, so its append fails.
+    rmSync(join(record(ended.dirName), "audit"), { recursive: true, force: true });
+    writeFileSync(join(record(ended.dirName), "audit"), "not a directory\n");
+
+    expect(fire('{"reason":"logout","session_id":"session-ended"}', proj).exitCode).toBe(0);
+    const drops = (dirName: string) => join(record(dirName), ".aidlc-engine", "hooks-health", "session-end.drops");
+    expect(existsSync(drops(ended.dirName))).toBe(true);
+    expect(existsSync(drops(other.dirName))).toBe(false);
+  });
+
+  test("a session whose binding moved to another intent ends there, not on its older stamp", () => {
+    const first = createIntent(proj, "first-work", "default", "feature");
+    const second = createIntent(proj, "second-work", "default", "feature");
+    const record = (dirName: string) => join(proj, "aidlc", "spaces", "default", "intents", dirName);
+    for (const intent of [first, second]) copyFileSync(MID_IDEATION, join(record(intent.dirName), "aidlc-state.md"));
+    // The switch rebound the session; the stamp update was interrupted.
+    writeSessionIntentUuid(proj, "session-moved", first.uuid);
+    writeSessionBinding(proj, "session-moved", "default", second.dirName, "switch");
+    setActiveIntentCursor(proj, first.dirName, "default");
+    expect(fire('{"reason":"logout","session_id":"session-moved"}', proj).exitCode).toBe(0);
+    const audit = (dirName: string) => {
+      try {
+        return readdirSync(join(record(dirName), "audit")).map((n) => readFileSync(join(record(dirName), "audit", n), "utf-8")).join("");
+      } catch {
+        return "";
+      }
+    };
+    expect(audit(second.dirName)).toContain("SESSION_ENDED");
+    expect(audit(first.dirName)).not.toContain("SESSION_ENDED");
+  });
+
+  test("a bound session without a stamp ends on its bound intent", () => {
+    const bound = createIntent(proj, "bound-work", "default", "feature");
+    const other = createIntent(proj, "other-work", "default", "feature");
+    const record = (dirName: string) => join(proj, "aidlc", "spaces", "default", "intents", dirName);
+    for (const intent of [bound, other]) copyFileSync(MID_IDEATION, join(record(intent.dirName), "aidlc-state.md"));
+    writeSessionBinding(proj, "session-bound", "default", bound.dirName, "switch");
+    setActiveIntentCursor(proj, other.dirName, "default");
+    expect(fire('{"reason":"logout","session_id":"session-bound"}', proj).exitCode).toBe(0);
+    expect(auditOf(record(bound.dirName))).toContain("SESSION_ENDED");
+    expect(auditOf(record(other.dirName))).not.toContain("SESSION_ENDED");
+  });
+
+  test("a session bound to no intent does not end the workflow the shared cursor names", () => {
+    const active = createIntent(proj, "active-work", "default", "feature");
+    const record = join(proj, "aidlc", "spaces", "default", "intents", active.dirName);
+    copyFileSync(MID_IDEATION, join(record, "aidlc-state.md"));
+    setActiveIntentCursor(proj, active.dirName, "default");
+    // A legacy registry row carries no uuid, so the UUID ownership check cannot refuse on its own.
+    const registry = join(proj, "aidlc", "spaces", "default", "intents", "intents.json");
+    const rows = JSON.parse(readFileSync(registry, "utf-8"));
+    const list = Array.isArray(rows) ? rows : rows.intents;
+    for (const row of list) delete row.uuid;
+    writeFileSync(registry, `${JSON.stringify(rows, null, 2)}\n`);
+    writeSessionBinding(proj, "session-none", "default", null, "archive");
+    expect(fire('{"reason":"logout","session_id":"session-none"}', proj).exitCode).toBe(0);
+    expect(auditOf(record)).not.toContain("SESSION_ENDED");
+    expect(existsSync(join(record, ".aidlc-engine", "hooks-health", "session-end.last"))).toBe(false);
+  });
+
+  test("a session bound to no intent ends the flat root workflow, not the record the cursor names", () => {
+    const active = createIntent(proj, "active-work", "default", "feature");
+    const intents = join(proj, "aidlc", "spaces", "default", "intents");
+    const record = join(intents, active.dirName);
+    copyFileSync(MID_IDEATION, join(record, "aidlc-state.md"));
+    // A flat root workflow shares the space with a record the shared cursor names.
+    copyFileSync(MID_IDEATION, join(intents, "aidlc-state.md"));
+    setActiveIntentCursor(proj, active.dirName, "default");
+    writeSessionBinding(proj, "session-flat", "default", null, "archive");
+    expect(fire('{"reason":"logout","session_id":"session-flat"}', proj).exitCode).toBe(0);
+    expect(auditOf(record)).not.toContain("SESSION_ENDED");
+    expect(existsSync(join(record, ".aidlc-engine", "hooks-health", "session-end.last"))).toBe(false);
+    expect(existsSync(join(intents, ".aidlc-engine", "hooks-health", "session-end.last"))).toBe(true);
+  });
+
+  test("a session switched to an empty space does not end its prior intent on the older stamp", () => {
+    const prior = createIntent(proj, "prior-work", "default", "feature");
+    const record = join(proj, "aidlc", "spaces", "default", "intents", prior.dirName);
+    copyFileSync(MID_IDEATION, join(record, "aidlc-state.md"));
+    setActiveIntentCursor(proj, prior.dirName, "default");
+    // The switch rebound the session to a space with no intent; clearing the stamp was interrupted.
+    writeSessionIntentUuid(proj, "session-switched", prior.uuid);
+    writeSessionBinding(proj, "session-switched", "empty", null, "space-switch-none");
+    expect(fire('{"reason":"logout","session_id":"session-switched"}', proj).exitCode).toBe(0);
+    expect(auditOf(record)).not.toContain("SESSION_ENDED");
+    expect(existsSync(join(record, ".aidlc-engine", "hooks-health", "session-end.last"))).toBe(false);
+  });
+});

@@ -1,0 +1,213 @@
+// t-tui-statusline.serial.tui.test.ts — render-fidelity: the AI-DLC statusline
+// draws in a REAL terminal (§5.2). A faithful port of the working spike
+// tests/spike/t-tui-statusline.sh (91 lines, plan 3) — SAME flow, expressed in
+// TS over the spawned tui-drive.ts subprocess instead of bash. No logic change.
+//
+// The flow the spike proved, step for step:
+//   1. Copy the distributable exactly as the README says:
+//        cp -r dist/claude/.claude/ <sandbox>/.claude/
+//      (dest .claude must NOT pre-exist, or cp nests it).
+//   2. Launch `claude` in a fixed-size session via the driver.
+//   3. Clear the two startup modals the spike discovered:
+//        a. workspace-trust dialog     -> "1. Yes, I trust"
+//        b. bypass-permissions warning  -> "2. Yes, I accept"
+//   4. Wait for the statusline marker "[AIDLC]" to paint and settle.
+//   5. Assert the captured pane contains "[AIDLC] ready" — the no-workflow
+//      statusline output from aidlc-statusline.ts (no aidlc-docs/ present).
+//   6. Open Claude's token-free `/model` picker and require its exact Unicode
+//      terminal palette (`❯`, `✔`, `●`/`◉`, `←/→`, and `·` separators).
+//
+// COST: this launches the claude TUI but submits NO prompt, so it reaches the
+// `ready` statusline state WITHOUT a Bedrock turn — it spends NO tokens (unlike
+// t-tui-workshop, which is AIDLC_TUI_LIVE-gated). It needs the selected TUI substrate + claude + the
+// distributable; absent any of those it SKIPs with a reason.
+//
+// Spawn tui-drive.ts using the shared runtime selector for the native Bun and
+// POSIX tmux backends. The driver subprocess remains the source of the `tui`
+// mechanism evidence.
+
+import { liveCaseTimeoutMs, LIVE_LONG_OPERATION_TIMEOUT_MS, remainingOperationTimeoutMs, remainingCleanupTimeoutMs, fileCleanupReserveMs, NATIVE_TERMINAL_CLEANUP_TIMEOUT_MS, NATIVE_STARTUP_TIMEOUT_MS } from "../harness/test-budget.ts";
+import { beforeEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { cleanupTuiProjectAfterKill, setupTuiProject } from "../harness/tui-fixtures.ts";
+import { resolveTuiRuntime, tuiUnavailableReason } from "../harness/tui-runtime.ts";
+
+function completedStartupProbe<T extends { error?: Error }>(result: T): T {
+  if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") throw result.error;
+  return result;
+}
+
+const TIMEOUT_S = Number(process.env.AIDLC_TEST_TIMEOUT);
+const TEST_TIMEOUT_MS = Number.isSafeInteger(TIMEOUT_S) && TIMEOUT_S > 0
+  ? TIMEOUT_S * 1000
+  : liveCaseTimeoutMs(LIVE_LONG_OPERATION_TIMEOUT_MS);
+let caseDeadlineMs: number;
+beforeEach(() => { caseDeadlineMs = Date.now() + TEST_TIMEOUT_MS; });
+function remainingWorkMs(): number {
+  return remainingOperationTimeoutMs(TEST_TIMEOUT_MS, {
+    deadlineMs: caseDeadlineMs,
+    reserveMs: fileCleanupReserveMs(TEST_TIMEOUT_MS),
+    phase: "E2E terminal work",
+  })!;
+}
+function remainingCleanupMs(): number {
+  return remainingCleanupTimeoutMs(NATIVE_TERMINAL_CLEANUP_TIMEOUT_MS, {
+    deadlineMs: caseDeadlineMs,
+    phase: "E2E terminal cleanup",
+  });
+}
+
+
+const DRIVER = join(import.meta.dir, "..", "harness", "tui-drive.ts");
+const AIDLC_SRC = join(import.meta.dir, "..", "..", "dist", "claude", ".claude");
+
+interface Run {
+  rc: number;
+  stdout: string;
+  stderr: string;
+}
+function drive(args: string[]): Run {
+  const { bin, prefix } = resolveTuiRuntime(DRIVER);
+  const res = spawnSync(bin, [...prefix, ...args], { timeout: args[0] === "kill" ? remainingCleanupMs() : remainingWorkMs(), encoding: "utf-8" });
+  return { rc: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+}
+// `wait` returns nonzero on timeout — we want a boolean for the idempotent modal
+// clears (only act if the modal is present), mirroring the spike's
+// `if drive wait ...; then send; fi`.
+function waitFor(session: string, pattern: string, timeoutMs: number, stableMs: number): boolean {
+  return (
+    drive([
+      "wait",
+      "--session",
+      session,
+      "--pattern",
+      pattern,
+      "--timeout-ms",
+      String(timeoutMs),
+      "--stable-ms",
+      String(stableMs),
+    ]).rc === 0
+  );
+}
+
+// ABSENT detection checks the selected substrate; claude
+// is needed on every platform; the distributable must be present to copy.
+function absentReason(): string | null {
+  const runtimeReason = tuiUnavailableReason();
+  if (runtimeReason) return runtimeReason;
+  if (completedStartupProbe(spawnSync("claude", ["--version"], { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" })).status !== 0) {
+    return "claude CLI not found";
+  }
+  if (!existsSync(AIDLC_SRC)) return `distributable missing: ${AIDLC_SRC}`;
+  return null;
+}
+const ABSENT_REASON = absentReason();
+
+describe("t-tui-statusline (statusline renders in a real terminal)", () => {
+  test.skipIf(ABSENT_REASON !== null)(
+    `[AIDLC] ready paints in the launched TUI${ABSENT_REASON ? ` — SKIP: ${ABSENT_REASON}` : ""}`,
+    () => {
+      const session = `aidlc_tui_statusline_${process.pid}`;
+      const sandbox = setupTuiProject({ noAidlcDocs: true });
+      try {
+        // The shared fixture copies the distributable and marks this fresh
+        // directory for the driver's interactive trust-menu handling.
+        const destClaude = join(sandbox, ".claude");
+        const settingsPath = join(destClaude, "settings.json");
+        expect(existsSync(settingsPath)).toBe(true);
+        // P0a — the retired spike (git show 4ce826b:tests/spike/t-tui-statusline.sh
+        // ~L55) also required settings.json to CARRY the "statusLine" key, not just
+        // exist: that key is what wires aidlc-statusline.ts into the TUI, so a copy
+        // that drops it would render no `[AIDLC]` line at all. Restore that guard.
+        expect(readFileSync(settingsPath, "utf8")).toContain('"statusLine"');
+
+        // --- step 2: launch the claude TUI ------------------------------------
+        const started = drive([
+          "start",
+          "--session",
+          session,
+          "--cwd",
+          sandbox,
+          "--width",
+          "120",
+          "--height",
+          "40",
+          "--",
+          "claude",
+          "--dangerously-skip-permissions",
+        ]);
+        expect(started.rc).toBe(0);
+
+        // Startup exits as soon as the target UI is ready; absent modals do not
+        // consume separate timeout windows. Navigation stays fixture-scoped.
+        const startup = drive([
+          "startup", "--session", session,
+          "--ready-pattern", "\\[AIDLC\\] ready", "--timeout-ms", String(remainingWorkMs()),
+        ]);
+        if (startup.rc !== 0) throw new Error(`TUI startup failed: ${startup.stderr}`);
+
+        // --- step 4: wait for the statusline marker ---------------------------
+        const sawMarker = waitFor(session, "\\[AIDLC\\]", remainingWorkMs(), 1000);
+        if (!sawMarker) {
+          const pane = drive(["capture", "--session", session]).stdout;
+          throw new Error(
+            `statusline marker [AIDLC] never appeared in the TUI.\n` +
+              `---- last pane ----\n${pane}\n-------------------`,
+          );
+        }
+
+        // --- step 5: assert the rendered statusline content -------------------
+        // The no-workflow state (no aidlc-docs/ present) renders "[AIDLC] ready"
+        // (aidlc-statusline.ts). This is the one thing the SDK path cannot see —
+        // the painted statusline.
+        const pane = drive(["capture", "--session", session]).stdout;
+        expect(pane).toContain("[AIDLC] ready");
+
+        // --- step 6: assert Claude's real Unicode menu palette ---------------
+        // This is not a synthetic emitter: `/model` opens Claude's built-in
+        // picker without submitting a prompt or spending model tokens. On
+        // Windows, Claude chooses ASCII fallbacks (`>` / `√`) when TERM is
+        // absent, which makes the strict answer-gate caret detector miss every
+        // real AUQ menu. Requiring the actual picker pins the child capability
+        // environment and the reconstructed glyph cells together.
+        drive([
+          "send",
+          "--session",
+          session,
+          "--keys",
+          "/model",
+          "--literal",
+          "--no-enter",
+        ]);
+        drive(["send", "--session", session, "--keys", "Enter", "--no-enter"]);
+        const sawModelMenu = waitFor(session, "Select model", remainingWorkMs(), 600);
+        const modelPane = drive(["capture", "--session", session]).stdout;
+        if (!sawModelMenu) {
+          throw new Error(
+            `Claude /model picker never appeared.\n` +
+              `---- last pane ----\n${modelPane}\n-------------------`,
+          );
+        }
+        expect(modelPane).toMatch(/^\s*❯\s+\d+\..*✔/m);
+        // Claude versions vary the bullet and effort default. Pin the actual
+        // control row, including its label and Unicode adjustment arrows,
+        // without selecting an effort level or changing the user's default.
+        expect(modelPane).toMatch(
+          /^\s*[●◉] (?:Low|Medium|High|xHigh|Max) effort(?: \(default\))? ←\/→ to adjust\s*$/m,
+        );
+        expect(modelPane).toContain(
+          "Enter to set as default · s to use this session only · Esc to cancel",
+        );
+      } finally {
+        cleanupTuiProjectAfterKill(
+          sandbox,
+          session,
+          drive(["kill", "--session", session]),
+        );
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+});

@@ -1,0 +1,1733 @@
+// covers: subcommand:aidlc-orchestrate:next, function:validateDirective,
+// function:reviewRecoverySpentMessage,
+// function:teamUnitGateStatus,
+// file:aidlc-common/protocols/stage-protocol-construction.md,
+// file:skills/aidlc/SKILL.md per-unit wave paragraph
+//
+// t278 - engine-emitted, receipt-settled waves for stage-major per-unit design.
+// The engine derives complete sibling entries from one healed Bolt-DAG snapshot,
+// keeps a batch active until every applicable unit has fresh review evidence,
+// and transports the optional wave through the existing steering boundary.
+
+import {
+  NATIVE_FIXTURE_SETUP_TIMEOUT_MS,
+  NATIVE_STARTUP_TIMEOUT_MS,
+  remainingOperationTimeoutMs,
+} from "../harness/test-budget.ts";
+import { afterEach, describe, expect, test, setDefaultTimeout } from "bun:test";
+import { spawnSync } from "node:child_process";
+import {
+  appendFileSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import {
+  activeUnitCheckpoint,
+  artifactFilename,
+  auditShards,
+  findStageBySlug,
+  freshReviewReceipts,
+  latestMainWorkflowStageRunFloorForProject,
+  readAllAuditShards,
+  splitKiroCommandArgs,
+  teamUnitGateStatus,
+} from "../../dist/claude/.claude/tools/aidlc-lib.ts";
+import {
+  appendAuditEntry,
+} from "../../dist/claude/.claude/tools/aidlc-audit.ts";
+import {
+  AIDLC_SRC,
+  cleanupTestProject,
+  createTestProject,
+  DEFAULT_RECORD_DIR,
+  DEFAULT_SPACE,
+  runOrchestrateNext,
+  seedAidlcMemory,
+  seedBoltDag,
+  seededRecordDir,
+  seededStateFile,
+} from "../harness/fixtures.ts";
+import { HARNESS_MATRIX } from "../harness/harness-matrix.ts";
+
+setDefaultTimeout(NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+const BUN = process.execPath;
+const ORCH = join(AIDLC_SRC, "tools", "aidlc-orchestrate.ts");
+const FREEZE = join(AIDLC_SRC, "hooks", "aidlc-review-freeze.ts");
+const LOG = join(AIDLC_SRC, "tools", "aidlc-log.ts");
+const STATE = join(AIDLC_SRC, "tools", "aidlc-state.ts");
+const RP = `aidlc/spaces/${DEFAULT_SPACE}/intents/${DEFAULT_RECORD_DIR}`;
+const SEP = "\u2014";
+const REQUIRED_FD = [
+  "entities",
+  "rules",
+  "functional-spec",
+  "traceability",
+];
+interface WaveEntry {
+  unit: string;
+  unit_kind: string | null;
+  build_required: boolean;
+  completion_required: boolean;
+  review_state:
+    | "outstanding"
+    | "retry-required"
+    | "repair-required"
+    | "recovery-required"
+    | "escalation-required"
+    | "READY"
+    | "NOT-READY"
+    | "not-required";
+  review_iteration: number | null;
+  unit_memory_path: string;
+  consumes: string[];
+  consumes_absent: Array<{ path: string; expected: boolean }>;
+  produces: string[];
+  required_produces: string[];
+}
+
+interface Directive {
+  kind?: string;
+  stage?: string;
+  unit?: string;
+  gate?: unknown;
+  memory_path?: string;
+  inline_context_paths?: string[];
+  context_warnings?: string[];
+  rules_in_context?: string[];
+  rules_content?: Array<{ path: string; text: string }>;
+  wave?: { batch_index: number; entries: WaveEntry[] };
+  message?: string;
+  [key: string]: unknown;
+}
+
+const tempDirs: string[] = [];
+afterEach(() => {
+  while (tempDirs.length > 0) cleanupTestProject(tempDirs.pop());
+});
+
+function row(marker: " " | "-" | "x", slug: string): string {
+  return `- [${marker}] ${slug} ${SEP} EXECUTE`;
+}
+
+function constructionState(
+  current: string,
+  iteration: "stage-major" | "unit-major" = "stage-major",
+  reviewOverride?: "advisory" | "none",
+  autonomy?: "autonomous" | "gated",
+  ownership?: "team",
+): string {
+  return `# AI-DLC State Tracking
+
+## Project Information
+- **Project**: wave test
+- **Project Type**: Greenfield
+- **Scope**: feature
+- **State Version**: 8
+- **Skeleton Stance**: on
+- **Construction Iteration**: ${iteration}
+${reviewOverride ? `- **Review Override**: ${reviewOverride}\n` : ""}
+${autonomy ? `- **Construction Autonomy Mode**: ${autonomy}\n` : ""}
+${ownership ? `- **Unit Ownership**: ${ownership}\n` : ""}
+
+## Scope Configuration
+- **Stages to Execute**: all
+- **Stages to Skip**: none
+- **Depth**: Standard
+- **Test Strategy**: Standard
+- **Change Control**: strict (from scope feature)
+
+## Stage Progress
+
+### INCEPTION PHASE
+${row("x", "domain-design")}
+${row("x", "units-generation")}
+
+### CONSTRUCTION PHASE
+${row(current === "functional-design" ? "-" : " ", "functional-design")}
+${row(current === "nfr-requirements" ? "-" : " ", "nfr-requirements")}
+${row(current === "nfr-design" ? "-" : " ", "nfr-design")}
+${row(current === "infrastructure-design" ? "-" : " ", "infrastructure-design")}
+${row(current === "code-generation" ? "-" : " ", "code-generation")}
+${row(" ", "build-and-test")}
+
+## Current Status
+- **Lifecycle Phase**: CONSTRUCTION
+- **Current Stage**: ${current}
+- **Status**: Running
+`;
+}
+
+function project(
+  current = "functional-design",
+  iteration: "stage-major" | "unit-major" = "stage-major",
+  reviewOverride?: "advisory" | "none",
+  autonomy?: "autonomous" | "gated",
+  ownership?: "team",
+): string {
+  const proj = createTestProject();
+  tempDirs.push(proj);
+  seedAidlcMemory(proj);
+  writeFileSync(
+    seededStateFile(proj),
+    constructionState(
+      current,
+      iteration,
+      reviewOverride,
+      autonomy,
+      ownership,
+    ),
+  );
+  return proj;
+}
+
+function next(proj: string) {
+  const env = { ...process.env };
+  delete env.AWS_AIDLC_DEFAULT_SCOPE;
+  env.AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD = "1";
+  const result = runOrchestrateNext(ORCH, proj, [], { env });
+  if (result.directive === null) {
+    throw new Error(
+      `next emitted no JSON: ${result.status}\n${result.stdout}\n${result.stderr}`,
+    );
+  }
+  if (result.directive.kind === "error") {
+    throw new Error(
+      `next emitted an error directive: ${String(result.directive.message)}`,
+    );
+  }
+  return {
+    ...result,
+    directive: result.directive as Directive,
+  };
+}
+
+function cover(
+  proj: string,
+  unit: string,
+  stage: string,
+  names: string[],
+): void {
+  const dir = join(seededRecordDir(proj), "construction", unit, stage);
+  mkdirSync(dir, { recursive: true });
+  for (const name of names) {
+    writeFileSync(join(dir, artifactFilename(name)), `# ${name} for ${unit}\n`);
+  }
+}
+
+function review(
+  proj: string,
+  unit: string,
+  verdict: "READY" | "NOT-READY" = "READY",
+  iteration = 1,
+): void {
+  const artifact = join(
+    seededRecordDir(proj),
+    "construction",
+    unit,
+    "functional-design",
+    "functional-spec.md",
+  );
+  if (!existsSync(artifact)) {
+    mkdirSync(dirname(artifact), { recursive: true });
+    writeFileSync(artifact, "# functional-spec\n", "utf-8");
+  } else {
+    const current = readFileSync(artifact, "utf-8");
+    const reviewStart = current.search(/^## Review[ \t]*$/m);
+    if (reviewStart !== -1) {
+      writeFileSync(
+        artifact,
+        `${current.slice(0, reviewStart).replace(/\s+$/, "")}\n`,
+        "utf-8",
+      );
+    }
+  }
+  const args = [
+    LOG,
+    "review",
+    "--stage",
+    "functional-design",
+    "--reviewer",
+    "aidlc-architecture-reviewer-agent",
+    "--unit",
+    unit,
+    "--iteration",
+    String(iteration),
+  ];
+  const env = {
+    ...process.env,
+    AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD: "1",
+  };
+  const requested = spawnSync(
+    BUN,
+    [...args, "--project-dir", proj],
+    { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8", env },
+  );
+  if ((requested.status ?? -1) !== 0) {
+    throw new Error(`review request failed: ${requested.stdout}${requested.stderr}`);
+  }
+  appendFileSync(
+    artifact,
+    `\n## Review\n\n**Verdict:** ${verdict}\n**Reviewer:** aidlc-architecture-reviewer-agent\n**Iteration:** ${iteration}\n\n### Findings\n\nFixture review.\n`,
+    "utf-8",
+  );
+  const completed = spawnSync(
+    BUN,
+    [...args, "--verdict", verdict, "--project-dir", proj],
+    { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8", env },
+  );
+  if ((completed.status ?? -1) !== 0) {
+    throw new Error(
+      `review completion failed: ${completed.stdout}${completed.stderr}`,
+    );
+  }
+}
+
+function requestReview(proj: string, unit: string, iteration = 1): void {
+  const result = reviewRequestResult(proj, unit, iteration);
+  if (result.status !== 0) {
+    throw new Error(`review request failed: ${result.out}`);
+  }
+}
+
+function reviewRequestResult(proj: string, unit: string, iteration = 1) {
+  const result = spawnSync(
+    BUN,
+    [
+      LOG,
+      "review",
+      "--stage",
+      "functional-design",
+      "--reviewer",
+      "aidlc-architecture-reviewer-agent",
+      "--unit",
+      unit,
+      "--iteration",
+      String(iteration),
+      "--project-dir",
+      proj,
+    ],
+    {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD: "1",
+      },
+    },
+  );
+  return {
+    status: result.status ?? -1,
+    out: `${result.stdout ?? ""}${result.stderr ?? ""}`,
+  };
+}
+
+function freezeWrite(
+  proj: string,
+  file: string,
+  enforceSummary = false,
+) {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    CLAUDE_PROJECT_DIR: proj,
+  };
+  if (enforceSummary) {
+    delete env.AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD;
+  } else {
+    env.AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD = "1";
+  }
+  const result = spawnSync(BUN, [FREEZE], {
+    timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+    input: JSON.stringify({
+      hook_event_name: "PreToolUse",
+      tool_name: "Write",
+      tool_input: { file_path: file },
+    }),
+    encoding: "utf-8",
+    env,
+  });
+  return {
+    status: result.status ?? -1,
+    out: `${result.stdout ?? ""}${result.stderr ?? ""}`,
+  };
+}
+
+function confirmUnitSummary(proj: string, unit: string): void {
+  const dir = join(
+    seededRecordDir(proj),
+    "construction",
+    unit,
+    "functional-design",
+  );
+  const questions = join(dir, "functional-design-questions.md");
+  const writeQuestions = (answer = ""): void => {
+    writeFileSync(
+      questions,
+      [
+        "# Functional Design Questions",
+        "",
+        "## Consolidated Summary Confirmation",
+        "",
+        "- Looks correct",
+        "- Request changes",
+        "",
+        `[Answer]: ${answer}`,
+        "",
+      ].join("\n"),
+    );
+  };
+  writeQuestions();
+  const env = { ...process.env };
+  delete env.AIDLC_SKIP_HUMAN_PRESENCE_GUARD;
+  delete env.AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD;
+  const decision = spawnSync(
+    BUN,
+    [
+      LOG,
+      "decision",
+      "--stage",
+      "functional-design",
+      "--decision",
+      "Does this all look correct?",
+      "--checkpoint",
+      "summary-confirmation",
+      "--questions-file",
+      questions,
+      "--unit",
+      unit,
+      "--project-dir",
+      proj,
+    ],
+    { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8", env },
+  );
+  if ((decision.status ?? -1) !== 0) {
+    throw new Error(`summary decision failed: ${decision.stdout}${decision.stderr}`);
+  }
+  appendAuditEntry("HUMAN_TURN", {}, proj);
+  writeQuestions("Looks correct");
+  const answer = spawnSync(
+    BUN,
+    [
+      LOG,
+      "answer",
+      "--stage",
+      "functional-design",
+      "--checkpoint",
+      "summary-confirmation",
+      "--questions-file",
+      questions,
+      "--unit",
+      unit,
+      "--details",
+      "Looks correct",
+      "--project-dir",
+      proj,
+    ],
+    { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8", env },
+  );
+  if ((answer.status ?? -1) !== 0) {
+    throw new Error(`summary answer failed: ${answer.stdout}${answer.stderr}`);
+  }
+  for (const name of REQUIRED_FD) {
+    const artifact = join(dir, artifactFilename(name));
+    writeFileSync(
+      artifact,
+      `${readFileSync(artifact, "utf-8")}\nconfirmed\n`,
+    );
+    appendAuditEntry(
+      "ARTIFACT_UPDATED",
+      { File: artifact, Tool: "Write" },
+      proj,
+    );
+  }
+}
+
+function guardRefusalCount(proj: string): number {
+  const dir = join(seededRecordDir(proj), ".aidlc-engine/guard-refusals");
+  const file = readdirSync(dir).find((name) => name.endsWith(".json"));
+  if (!file) throw new Error("guard refusal record missing");
+  return (
+    JSON.parse(readFileSync(join(dir, file), "utf-8")) as { count: number }
+  ).count;
+}
+
+function completeWave(proj: string, unit: string): void {
+  const result = spawnSync(
+    BUN,
+    [
+      STATE,
+      "unit",
+      "complete",
+      "--wave",
+      "--stage",
+      "functional-design",
+      "--unit",
+      unit,
+      "--project-dir",
+      proj,
+    ],
+    {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD: "1",
+      },
+    },
+  );
+  if ((result.status ?? -1) !== 0) {
+    throw new Error(`wave completion failed: ${result.stdout}${result.stderr}`);
+  }
+}
+
+function stateCommand(proj: string, args: string[]) {
+  const result = spawnSync(
+    BUN,
+    [STATE, ...args, "--project-dir", proj],
+    {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD: "1",
+      },
+    },
+  );
+  return {
+    status: result.status ?? -1,
+    out: `${result.stdout ?? ""}${result.stderr ?? ""}`,
+  };
+}
+
+function approveIteration(proj: string, stage: string, value: "stage-major" | "unit-major"): void {
+  const session = "t278-iteration";
+  const env = {
+    ...process.env,
+    AIDLC_PROJECT_DIR: proj,
+    CLAUDE_PROJECT_DIR: proj,
+    AIDLC_SKIP_HUMAN_PRESENCE_GUARD: undefined,
+    AIDLC_UNATTENDED: undefined,
+  };
+  for (const action of ["decision", "answer"]) {
+    const result = spawnSync(BUN, [
+      LOG, action, "--stage", stage, "--checkpoint", "construction-policy",
+      "--field", "Construction Iteration", "--value", value, "--session", session,
+      ...(action === "decision"
+        ? ["--decision", `Change Construction Iteration to ${value}?`, "--options", "Approve,Request Changes"]
+        : ["--details", "Approve"]),
+      "--project-dir", proj,
+    ], { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8", env });
+    expect(result.status, `${result.stdout}${result.stderr}`).toBe(0);
+    if (action === "decision") {
+      const human = spawnSync(BUN, [join(AIDLC_SRC, "tools", "aidlc.ts"), "engine", "hook", "record-human-turn"], {
+        timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+        encoding: "utf-8", cwd: proj, env,
+        input: JSON.stringify({
+          hook_event_name: "UserPromptSubmit", session_id: session, prompt: "Approve",
+        }),
+      });
+      expect(human.status, `${human.stdout}${human.stderr}`).toBe(0);
+    }
+  }
+}
+
+function unitVerbResult(
+  proj: string,
+  action: string,
+  unit: string,
+  extra: string[] = [],
+  stage = "functional-design",
+) {
+  return stateCommand(proj, [
+    "unit",
+    action,
+    "--stage",
+    stage,
+    "--unit",
+    unit,
+    ...extra,
+  ]);
+}
+
+function addRuntimeState(proj: string): void {
+  const file = seededStateFile(proj);
+  writeFileSync(
+    file,
+    readFileSync(file, "utf-8").replace(
+      "## Current Status",
+      "## Runtime State\n- **Revision Count**: 0\n\n## Current Status",
+    ),
+  );
+}
+
+function auditBytes(proj: string) {
+  return auditShards(proj).map((path) => ({
+    path,
+    bytes: readFileSync(path),
+  }));
+}
+
+function reportRejected(proj: string, feedback: string) {
+  const env = { ...process.env };
+  env.AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD = "1";
+  delete env.AIDLC_SKIP_HUMAN_PRESENCE_GUARD;
+  const result = spawnSync(
+    BUN,
+    [
+      ORCH,
+      "report",
+      "--stage",
+      "functional-design",
+      "--result",
+      "rejected",
+      "--user-input",
+      "Request Changes",
+      "--reason",
+      feedback,
+      "--project-dir",
+      proj,
+    ],
+    { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8", env },
+  );
+  return {
+    status: result.status ?? -1,
+    out: `${result.stdout ?? ""}${result.stderr ?? ""}`,
+  };
+}
+
+function auditEventCount(proj: string, event: string): number {
+  return readAllAuditShards(proj)
+    .split("\n")
+    .filter((line) => line === `**Event**: ${event}`).length;
+}
+
+function writeDependencyArtifact(
+  proj: string,
+  units: Array<{ name: string; kind?: string; depends_on: string[] }>,
+): void {
+  const dir = join(seededRecordDir(proj), "inception", "units-generation");
+  mkdirSync(dir, { recursive: true });
+  const lines = ["# Unit Dependency", "", "```yaml", "units:"];
+  for (const unit of units) {
+    lines.push(`  - name: ${unit.name}`);
+    if (unit.kind) lines.push(`    kind: ${unit.kind}`);
+    lines.push(
+      `    depends_on: [${unit.depends_on.join(", ")}]`,
+    );
+  }
+  lines.push("```", "");
+  writeFileSync(join(dir, "unit-of-work-dependency.md"), lines.join("\n"));
+}
+
+describe("t278 engine-emitted wave contract", () => {
+  test("mixed-kind entries are independently resolved and keep parent versus unit memory distinct", () => {
+    const proj = project("infrastructure-design");
+    const knowledgeDir = join(
+      proj,
+      "aidlc",
+      "spaces",
+      "default",
+      "knowledge",
+      "aidlc-aws-platform-agent",
+    );
+    mkdirSync(knowledgeDir, { recursive: true });
+    symlinkSync(
+      join(knowledgeDir, "missing-target.md"),
+      join(knowledgeDir, "broken.md"),
+    );
+    seedBoltDag(proj, [
+      { name: "api", kind: "service" },
+      { name: "web", kind: "ui" },
+      { name: "contract", kind: "spec" },
+    ]);
+
+    const result = next(proj);
+    const directive = result.directive;
+    expect(directive.kind).toBe("run-stage");
+    expect(directive.stage).toBe("infrastructure-design");
+    expect(directive.wave?.batch_index).toBe(0);
+    expect(directive.wave?.entries.map((entry) => entry.unit)).toEqual([
+      "api",
+      "web",
+    ]);
+
+    const api = directive.wave?.entries[0] as WaveEntry;
+    const web = directive.wave?.entries[1] as WaveEntry;
+    expect(api.unit_kind).toBe("service");
+    expect(api.completion_required).toBe(true);
+    expect(api.required_produces).toHaveLength(4);
+    expect(
+      api.required_produces.every((path) =>
+        path.includes("/construction/api/infrastructure-design/")
+      ),
+    ).toBe(true);
+    expect(web.unit_kind).toBe("ui");
+    expect(web.required_produces).toEqual([
+      `${RP}/construction/web/infrastructure-design/infrastructure-specification.md`,
+      `${RP}/construction/web/infrastructure-design/monitoring-design.md`,
+      `${RP}/construction/web/infrastructure-design/cicd-pipeline.md`,
+      `${RP}/construction/web/infrastructure-design/traceability.json`,
+    ]);
+    expect(api.consumes_absent).toBeArray();
+    expect(web.consumes_absent).toBeArray();
+    expect(directive.memory_path).toBe(
+      `${RP}/construction/infrastructure-design/memory.md`,
+    );
+    expect(api.unit_memory_path).toBe(
+      `${RP}/construction/api/infrastructure-design/memory.md`,
+    );
+    expect(web.unit_memory_path).toBe(
+      `${RP}/construction/web/infrastructure-design/memory.md`,
+    );
+
+    // The rules ride inline on the run-stage when they fit (the shipped case)
+    // or arrive through load-steering parts when they do not; either way the
+    // delivered paths are exactly rules_in_context.
+    const deliveredEntries = [
+      ...result.steering.flatMap(
+        (part) => part.rules_content as Array<{ path: string; text: string }>,
+      ),
+      ...(directive.rules_content ?? []),
+    ];
+    expect(deliveredEntries.length).toBeGreaterThan(0);
+    expect(directive.rules_in_context?.length ?? 0).toBeGreaterThan(0);
+    expect(directive.inline_context_paths?.length ?? 0).toBeGreaterThan(0);
+    const deliveredRulePaths = [
+      ...new Set(deliveredEntries.map((entry) => entry.path)),
+    ];
+    expect(deliveredRulePaths).toEqual(directive.rules_in_context ?? []);
+    expect(directive.context_warnings?.join("\n")).toContain(
+      "aidlc-aws-platform-agent/broken.md",
+    );
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("downstream consumes omit artifacts pruned by the producer for this unit kind", () => {
+    const proj = project("nfr-design");
+    seedBoltDag(proj, [{ name: "contract", kind: "spec" }]);
+
+    const entry = next(proj).directive.wave?.entries[0] as WaveEntry;
+    const consumePaths = [
+      ...entry.consumes,
+      ...entry.consumes_absent.map((item) => item.path),
+    ];
+    for (const pruned of [
+      "performance-requirements",
+      "scalability-requirements",
+      "reliability-requirements",
+      "observability-requirements",
+    ]) {
+      expect(consumePaths.some((path) => path.endsWith(`/${pruned}.md`))).toBe(
+        false,
+      );
+    }
+    expect(consumePaths).toContain(
+      `${RP}/construction/contract/nfr-requirements/security-requirements.md`,
+    );
+    expect(consumePaths).toContain(
+      `${RP}/construction/contract/nfr-requirements/tech-stack-decisions.md`,
+    );
+    expect(consumePaths).toContain(
+      `${RP}/construction/contract/functional-design/functional-spec.md`,
+    );
+    expect(entry.required_produces).toEqual([
+      `${RP}/construction/contract/nfr-design/security-design.md`,
+      `${RP}/construction/contract/nfr-design/traceability.json`,
+    ]);
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("wave membership comes from the healed authored DAG, never the stale cache", () => {
+    const proj = project();
+    seedBoltDag(
+      proj,
+      [
+        { name: "alpha", kind: "service" },
+        { name: "beta", kind: "service" },
+      ],
+      [["alpha", "beta"]],
+    );
+    writeDependencyArtifact(proj, [
+      { name: "alpha", kind: "service", depends_on: [] },
+      { name: "beta", kind: "service", depends_on: ["alpha"] },
+    ]);
+
+    const result = next(proj);
+    expect(result.directive.wave?.batch_index).toBe(0);
+    expect(result.directive.wave?.entries.map((entry) => entry.unit)).toEqual([
+      "alpha",
+    ]);
+    expect(result.stderr).toContain("bolt_dag is missing or stale");
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("dependent batches wait for fresh terminal receipts, including NOT-READY at cap", () => {
+    const proj = project();
+    seedBoltDag(
+      proj,
+      ["alpha", "beta"],
+      [["alpha"], ["beta"]],
+    );
+    cover(proj, "alpha", "functional-design", REQUIRED_FD);
+
+    const alphaReview = next(proj).directive;
+    expect(alphaReview.unit).toBe("alpha");
+    expect(alphaReview.gate).toBe(false);
+    expect(alphaReview.wave?.entries[0]).toMatchObject({
+      unit: "alpha",
+      build_required: false,
+      review_state: "outstanding",
+    });
+
+    review(proj, "alpha");
+    expect(next(proj).directive.wave?.entries[0]).toMatchObject({
+      unit: "alpha",
+      build_required: false,
+      completion_required: true,
+      review_state: "READY",
+    });
+    completeWave(proj, "alpha");
+    const betaBuild = next(proj).directive;
+    expect(betaBuild.unit).toBe("beta");
+    expect(betaBuild.wave?.batch_index).toBe(1);
+    expect(betaBuild.wave?.entries[0].build_required).toBe(true);
+
+    cover(proj, "beta", "functional-design", REQUIRED_FD);
+    const betaReview = next(proj).directive;
+    expect(betaReview.unit).toBe("beta");
+    expect(betaReview.gate).toBe(false);
+    expect(betaReview.wave?.entries[0]).toMatchObject({
+      build_required: false,
+      review_state: "outstanding",
+    });
+
+    review(proj, "beta", "NOT-READY", 1);
+    const repair = next(proj).directive;
+    expect(repair.unit).toBe("beta");
+    expect(repair.gate).toBe(false);
+    expect(repair.wave?.entries[0]).toMatchObject({
+      review_state: "repair-required",
+      review_iteration: 1,
+    });
+
+    writeFileSync(
+      join(
+        seededRecordDir(proj),
+        "construction",
+        "beta",
+        "functional-design",
+        "functional-spec.md",
+      ),
+      "# repaired after iteration 1\n",
+    );
+    const reReview = next(proj).directive;
+    expect(reReview.wave?.entries[0]).toMatchObject({
+      review_state: "outstanding",
+      review_iteration: 2,
+    });
+
+    review(proj, "beta", "NOT-READY", 2);
+    const completion = next(proj).directive;
+    expect(completion.wave?.entries[0]).toMatchObject({
+      unit: "beta",
+      completion_required: true,
+      review_state: "NOT-READY",
+    });
+    completeWave(proj, "beta");
+    const settled = next(proj).directive;
+    expect(settled.unit).toBe("beta");
+    expect(settled.gate).toBe(true);
+    expect(settled.wave).toBeUndefined();
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("a post-review artifact change reopens only its owning earlier batch", () => {
+    const proj = project();
+    seedBoltDag(
+      proj,
+      ["alpha", "beta"],
+      [["alpha"], ["beta"]],
+    );
+    cover(proj, "alpha", "functional-design", REQUIRED_FD);
+    cover(proj, "beta", "functional-design", REQUIRED_FD);
+    review(proj, "alpha");
+    review(proj, "beta");
+    completeWave(proj, "alpha");
+    completeWave(proj, "beta");
+    expect(next(proj).directive.gate).toBe(true);
+
+    writeFileSync(
+      join(
+        seededRecordDir(proj),
+        "construction",
+        "alpha",
+        "functional-design",
+        "functional-spec.md",
+      ),
+      "# changed after review\n",
+    );
+    const reopened = next(proj).directive;
+    expect(reopened.wave?.batch_index).toBe(0);
+    expect(reopened.wave?.entries).toHaveLength(1);
+    expect(reopened.wave?.entries[0]).toMatchObject({
+      unit: "alpha",
+      build_required: false,
+      completion_required: true,
+      review_state: "recovery-required",
+      review_iteration: 2,
+    });
+
+    const recoveryIteration = reopened.wave?.entries[0].review_iteration;
+    expect(recoveryIteration).toBe(2);
+    review(proj, "alpha", "READY", recoveryIteration ?? 0);
+    expect(next(proj).directive.wave?.entries[0]).toMatchObject({
+      unit: "alpha",
+      completion_required: true,
+      review_state: "READY",
+    });
+    completeWave(proj, "alpha");
+    expect(next(proj).directive.gate).toBe(true);
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  // Under Guard Policy relaxed and off the same change is accepted: the review
+  // stands, so the completion does too, and the stage's gate opens instead of
+  // the entry being handed back.
+  for (const policy of ["relaxed (set by you)", "off (set by you)"]) {
+    test(`Guard Policy ${policy.split(" ")[0]}: a post-review artifact change keeps the wave settled`, () => {
+      const proj = project();
+      writeFileSync(seededStateFile(proj), readFileSync(seededStateFile(proj), "utf-8")
+        .replace("- **Change Control**: strict (from scope feature)", `- **Guard Policy**: ${policy}`));
+      seedBoltDag(proj, ["alpha", "beta"], [["alpha"], ["beta"]]);
+      cover(proj, "alpha", "functional-design", REQUIRED_FD);
+      cover(proj, "beta", "functional-design", REQUIRED_FD);
+      review(proj, "alpha");
+      review(proj, "beta");
+      completeWave(proj, "alpha");
+      completeWave(proj, "beta");
+      expect(next(proj).directive.gate).toBe(true);
+      writeFileSync(join(seededRecordDir(proj), "construction", "alpha", "functional-design", "functional-spec.md"),
+        "# changed after review\n");
+      const after = next(proj).directive;
+      expect(after.wave, JSON.stringify(after)).toBeUndefined();
+      expect(after.gate).toBe(true);
+      // The gate opens and says the change once.
+      const opened = spawnSync(BUN, [ORCH, "report", "--stage", "functional-design", "--result", "awaiting-approval", "--project-dir", proj], {
+        timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8",
+        env: { ...process.env, AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD: "1" },
+      });
+      expect(opened.status, `${opened.stdout}${opened.stderr}`).toBe(0);
+      expect(`${opened.stdout}`).toContain("The alpha Unit's Functional Design documents changed after they were reviewed; carrying on.");
+    }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+  }
+
+  test("a second stale wave receipt escalates instead of re-emitting recovery", () => {
+    const proj = project();
+    seedBoltDag(proj, ["alpha"]);
+    cover(proj, "alpha", "functional-design", REQUIRED_FD);
+    review(proj, "alpha");
+
+    writeFileSync(
+      join(
+        seededRecordDir(proj),
+        "construction",
+        "alpha",
+        "functional-design",
+        "functional-spec.md",
+      ),
+      "# changed before recovery\n",
+    );
+    const recovery = next(proj).directive.wave?.entries[0];
+    expect(recovery).toMatchObject({
+      unit: "alpha",
+      review_state: "recovery-required",
+      review_iteration: 2,
+    });
+    review(proj, "alpha", "READY", recovery?.review_iteration ?? 0);
+
+    writeFileSync(
+      join(
+        seededRecordDir(proj),
+        "construction",
+        "alpha",
+        "functional-design",
+        "functional-spec.md",
+      ),
+      "# changed after recovery\n",
+    );
+    const receipts = freshReviewReceipts(
+      proj,
+      readFileSync(seededStateFile(proj), "utf-8"),
+      findStageBySlug("functional-design")!,
+    );
+    expect(receipts.unitStaleProgress.get("alpha")).toEqual({
+      nextIteration: 3,
+      recoverySpent: true,
+    });
+    expect(next(proj).directive).toMatchObject({
+      kind: "ask",
+      ask_type: "guard-recovery",
+      reason_codes: ["REVIEW_RECOVERY_SPENT"],
+      unit: "alpha",
+    });
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("team revising Units route freeze and spent-review refusals to redo", () => {
+    const proj = project(
+      "functional-design",
+      "stage-major",
+      undefined,
+      undefined,
+      "team",
+    );
+    seedBoltDag(proj, ["alpha"]);
+    cover(proj, "alpha", "functional-design", REQUIRED_FD);
+    appendAuditEntry(
+      "GATE_REJECTED",
+      {
+        Stage: "functional-design",
+        Unit: "alpha",
+        "Gate Scope": "per-stage",
+        "Gate Stages": "functional-design",
+        Feedback: "revise alpha",
+      },
+      proj,
+    );
+    appendAuditEntry(
+      "STAGE_REVISING",
+      {
+        Stage: "functional-design",
+        Unit: "alpha",
+        "Gate Scope": "per-stage",
+        "Gate Stages": "functional-design",
+      },
+      proj,
+    );
+    expect(readFileSync(seededStateFile(proj), "utf-8")).toContain(
+      "- [-] functional-design",
+    );
+
+    review(proj, "alpha");
+    const artifact = join(
+      seededRecordDir(proj),
+      "construction",
+      "alpha",
+      "functional-design",
+      "functional-spec.md",
+    );
+    const frozen = freezeWrite(proj, artifact);
+    expect(frozen.status, frozen.out).toBe(2);
+    expect(frozen.out).toContain("Finish the current revision");
+    expect(frozen.out).toContain("--result revised");
+    expect(frozen.out).not.toContain("Request Changes");
+    expect(frozen.out).not.toContain("--result rejected");
+    // What the refusal left is what the next `next` hands on: finishing the
+    // revision is the agent's own work, so the person is not asked to choose it
+    // over starting the stage again; they judge at the approval it reopens.
+    const asked = JSON.stringify(next(proj).directive);
+    expect(asked).toContain('"ask_type":"guard-recovery"');
+    expect(asked).toContain('"agent_work":true');
+    expect(asked).toContain("--result revised");
+    expect(asked).not.toContain("/aidlc --stage functional-design");
+    expect(asked).not.toContain("Request Changes");
+    expect(asked).not.toContain("--result rejected");
+
+    writeFileSync(artifact, "# changed before recovery\n");
+    review(proj, "alpha", "READY", 2);
+    writeFileSync(artifact, "# changed after recovery\n");
+    const spent = reviewRequestResult(proj, "alpha", 3);
+    expect(spent.status).not.toBe(0);
+    expect(spent.out).toContain("Restart the stage from the top");
+    expect(spent.out).toContain("/aidlc --stage functional-design");
+    expect(spent.out).not.toContain("--result revised");
+    expect(spent.out).not.toContain("Request Changes");
+    expect(spent.out).not.toContain("--result rejected");
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("unit-end finish-revision reopens the final gate stage", () => {
+    const proj = project(
+      "functional-design",
+      "stage-major",
+      undefined,
+      undefined,
+      "team",
+    );
+    writeFileSync(
+      seededStateFile(proj),
+      readFileSync(seededStateFile(proj), "utf-8").replace(
+        "- **Unit Ownership**: team",
+        "- **Unit Ownership**: team\n" +
+          "- **Unit Gate Rhythm**: unit-end",
+      )
+        .replace(
+          "- [ ] nfr-design \u2014 EXECUTE",
+          "- [S] nfr-design \u2014 SKIP: fixture",
+        )
+        .replace(
+          "- [ ] infrastructure-design \u2014 EXECUTE",
+          "- [S] infrastructure-design \u2014 SKIP: fixture",
+        )
+        .replace(
+          "- [ ] code-generation \u2014 EXECUTE",
+          "- [S] code-generation \u2014 SKIP: fixture",
+        ),
+    );
+    seedBoltDag(proj, ["alpha"]);
+    cover(proj, "alpha", "functional-design", REQUIRED_FD);
+    cover(
+      proj,
+      "alpha",
+      "nfr-requirements",
+      findStageBySlug("nfr-requirements")?.produces ?? [],
+    );
+    const gateStages = "functional-design,nfr-requirements";
+    appendAuditEntry(
+      "GATE_REJECTED",
+      {
+        Stage: "nfr-requirements",
+        Unit: "alpha",
+        "Gate Scope": "unit-end",
+        "Gate Stages": gateStages,
+        Feedback: "revise alpha",
+      },
+      proj,
+    );
+    appendAuditEntry(
+      "STAGE_REVISING",
+      {
+        Stage: "nfr-requirements",
+        Unit: "alpha",
+        "Gate Scope": "unit-end",
+        "Gate Stages": gateStages,
+      },
+      proj,
+    );
+    for (const stage of ["functional-design", "nfr-requirements"]) {
+      appendAuditEntry(
+        "UNIT_COMPLETED",
+        {
+          Stage: stage,
+          Unit: "alpha",
+          "Run floor": latestMainWorkflowStageRunFloorForProject(
+            proj,
+            stage,
+            false,
+            "alpha",
+          ),
+        },
+        proj,
+      );
+    }
+    review(proj, "alpha");
+
+    const artifact = join(
+      seededRecordDir(proj),
+      "construction",
+      "alpha",
+      "functional-design",
+      "functional-spec.md",
+    );
+    const frozen = freezeWrite(proj, artifact);
+    expect(frozen.status, frozen.out).toBe(2);
+    expect(frozen.out).toContain("--result revised");
+    const command = /`([^`]+--result revised[^`]*)`/.exec(frozen.out)?.[1];
+    expect(command).toBeString();
+    expect(command).toContain(
+      "report --stage nfr-requirements --unit alpha --result revised",
+    );
+    expect(command).not.toContain("report --stage functional-design");
+
+    writeFileSync(
+      seededStateFile(proj),
+      readFileSync(seededStateFile(proj), "utf-8").replace(
+        "- **Test Strategy**: Standard",
+        "- **Test Strategy**: Standard\n- **Review Override**: none",
+      ),
+    );
+    symlinkSync(AIDLC_SRC, join(proj, ".claude"), "dir");
+    const argv = splitKiroCommandArgs(command!);
+    const revised = spawnSync(argv[0], argv.slice(1), {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      cwd: proj,
+      encoding: "utf-8",
+      env: {
+        ...process.env,
+        AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD: "1",
+        AIDLC_SKIP_HUMAN_PRESENCE_GUARD: "1",
+      },
+    });
+    expect(
+      revised.status,
+      `${revised.stdout ?? ""}${revised.stderr ?? ""}`,
+    ).toBe(0);
+    expect(revised.stdout).toContain(
+      'Recorded revised for unit \\"alpha\\" of \\"nfr-requirements\\".',
+    );
+    expect(teamUnitGateStatus(
+      proj,
+      readFileSync(seededStateFile(proj), "utf-8"),
+      "functional-design",
+      "alpha",
+    )).toMatchObject({
+      resolved: true,
+      scope: "unit-end",
+      status: "awaiting-approval",
+      gateStage: "nfr-requirements",
+    });
+    const audit = readAllAuditShards(proj);
+    expect(audit).toContain("**Event**: STAGE_AWAITING_APPROVAL");
+    expect(audit).toContain("**Stage**: nfr-requirements");
+    expect(audit).not.toContain("**Event**: STAGE_JUMPED");
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("a Unit freeze streak ignores sibling summary progress", () => {
+    const proj = project();
+    seedBoltDag(proj, ["alpha", "beta"]);
+    cover(proj, "alpha", "functional-design", REQUIRED_FD);
+    cover(proj, "beta", "functional-design", REQUIRED_FD);
+    confirmUnitSummary(proj, "alpha");
+    review(proj, "alpha");
+    const alphaArtifact = join(
+      seededRecordDir(proj),
+      "construction",
+      "alpha",
+      "functional-design",
+      "functional-spec.md",
+    );
+
+    const first = freezeWrite(proj, alphaArtifact, true);
+    expect(first.status, first.out).toBe(2);
+    expect(guardRefusalCount(proj)).toBe(1);
+
+    confirmUnitSummary(proj, "beta");
+    const second = freezeWrite(proj, alphaArtifact, true);
+    expect(second.status, second.out).toBe(2);
+    expect(guardRefusalCount(proj)).toBe(2);
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("an autonomous inline wave cannot reset spent recovery without a human turn", () => {
+    const proj = project(
+      "functional-design",
+      "stage-major",
+      undefined,
+      "autonomous",
+    );
+    seedBoltDag(proj, ["alpha"]);
+    cover(proj, "alpha", "functional-design", REQUIRED_FD);
+    review(proj, "alpha");
+
+    const artifact = join(
+      seededRecordDir(proj),
+      "construction",
+      "alpha",
+      "functional-design",
+      "functional-spec.md",
+    );
+    writeFileSync(artifact, "# changed before recovery\n");
+    review(proj, "alpha", "READY", 2);
+    writeFileSync(artifact, "# changed after recovery\n");
+
+    expect(next(proj).directive).toMatchObject({
+      kind: "ask",
+      ask_type: "guard-recovery",
+      reason_codes: ["REVIEW_RECOVERY_SPENT"],
+      unit: "alpha",
+    });
+
+    const rejected = reportRejected(
+      proj,
+      "Request Changes: restart review after the invalidating write",
+    );
+    expect(rejected.status).toBe(0);
+    expect(rejected.out).toContain('"kind":"print"');
+    expect(rejected.out).toContain("Cannot request changes");
+    expect(rejected.out).toContain(
+      "recovery review has already been used",
+    );
+    expect(rejected.out).toContain("only a new human choice");
+    expect(next(proj).directive).toMatchObject({
+      kind: "ask",
+      ask_type: "guard-recovery",
+      reason_codes: ["REVIEW_RECOVERY_SPENT"],
+      unit: "alpha",
+    });
+
+    const stillSpent = reviewRequestResult(proj, "alpha", 1);
+    expect(stillSpent.status).not.toBe(0);
+    expect(stillSpent.out).toContain(
+      "one recovery review was already used",
+    );
+    expect(stillSpent.out).toContain("Request Changes decision");
+    expect(auditEventCount(proj, "GATE_REJECTED")).toBe(0);
+
+    appendAuditEntry("HUMAN_TURN", {}, proj);
+    const humanRejected = reportRejected(
+      proj,
+      "Request Changes: restart review after the invalidating write",
+    );
+    expect(humanRejected.status).toBe(0);
+    expect(humanRejected.out).not.toContain('"kind":"error"');
+    expect(auditEventCount(proj, "GATE_REJECTED")).toBe(1);
+
+    const restarted = reviewRequestResult(proj, "alpha", 1);
+    expect(restarted.status).toBe(0);
+    expect(restarted.out).toContain('"emitted":"REVIEW_REQUESTED"');
+    expect(restarted.out).not.toContain('"recovery"');
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("fully settled siblings are omitted from a repeated same-batch wave", () => {
+    const proj = project();
+    seedBoltDag(proj, ["alpha", "beta"]);
+    cover(proj, "alpha", "functional-design", REQUIRED_FD);
+    review(proj, "alpha");
+    completeWave(proj, "alpha");
+
+    const wave = next(proj).directive.wave;
+    expect(wave?.batch_index).toBe(0);
+    expect(wave?.entries.map((entry) => entry.unit)).toEqual(["beta"]);
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("large independent batches emit deterministic same-batch prefixes below the transport cap", () => {
+    const proj = project();
+    const installedTemplate = join(
+      proj,
+      ".claude",
+      "knowledge",
+      "aidlc-shared",
+      "memory-template.md",
+    );
+    mkdirSync(dirname(installedTemplate), { recursive: true });
+    copyFileSync(
+      join(AIDLC_SRC, "knowledge", "aidlc-shared", "memory-template.md"),
+      installedTemplate,
+    );
+    const units = Array.from({ length: 100 }, (_, index) => ({
+      name: `unit-${index.toString().padStart(3, "0")}`,
+      kind: "service",
+    }));
+    seedBoltDag(proj, units);
+    const result = next(proj);
+    const entries = result.directive.wave?.entries ?? [];
+    expect(entries.length).toBeGreaterThan(0);
+    expect(entries.length).toBeLessThan(units.length);
+    expect(entries[0].unit).toBe("unit-000");
+    expect(result.directive.wave?.batch_index).toBe(0);
+    expect(Buffer.byteLength(result.stdout.trim(), "utf-8")).toBeLessThanOrEqual(
+      28 * 1024,
+    );
+    const emitted = new Set(entries.map((entry) => entry.unit));
+    for (const unit of units) {
+      const memory = join(
+        seededRecordDir(proj),
+        "construction",
+        unit.name,
+        "functional-design",
+        "memory.md",
+      );
+      expect(existsSync(memory)).toBe(emitted.has(unit.name));
+    }
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("an unmatched paired review request is re-emitted as retry-required", () => {
+    const proj = project();
+    seedBoltDag(proj, ["alpha"]);
+    cover(proj, "alpha", "functional-design", REQUIRED_FD);
+    requestReview(proj, "alpha");
+
+    expect(next(proj).directive.wave?.entries[0]).toMatchObject({
+      unit: "alpha",
+      review_state: "retry-required",
+      review_iteration: 1,
+      completion_required: true,
+    });
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("effective advisory and none review classes settle with their declared contracts", () => {
+    const advisory = project("functional-design", "stage-major", "advisory");
+    seedBoltDag(advisory, ["alpha"]);
+    cover(advisory, "alpha", "functional-design", REQUIRED_FD);
+    review(advisory, "alpha", "NOT-READY", 1);
+    expect(next(advisory).directive.wave?.entries[0]).toMatchObject({
+      review_state: "NOT-READY",
+      completion_required: true,
+    });
+    completeWave(advisory, "alpha");
+    expect(next(advisory).directive.gate).toBe(true);
+
+    const none = project("functional-design", "stage-major", "none");
+    seedBoltDag(none, ["alpha"]);
+    cover(none, "alpha", "functional-design", REQUIRED_FD);
+    expect(next(none).directive.wave?.entries[0]).toMatchObject({
+      review_state: "not-required",
+      completion_required: true,
+    });
+    completeWave(none, "alpha");
+    expect(next(none).directive.gate).toBe(true);
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("wave completion fans Unit memory into the parent diary before settlement", () => {
+    const proj = project();
+    seedBoltDag(proj, ["alpha"]);
+    cover(proj, "alpha", "functional-design", REQUIRED_FD);
+    const unitMemory = join(
+      seededRecordDir(proj),
+      "construction",
+      "alpha",
+      "functional-design",
+      "memory.md",
+    );
+    writeFileSync(
+      unitMemory,
+      "## Interpretations\n- 2026-08-12T00:00:00Z \u2014 preserve this note; verbatim context\n\n## Deviations\n\n## Tradeoffs\n\n## Open questions\n",
+    );
+    review(proj, "alpha");
+    expect(next(proj).directive.wave?.entries[0]).toMatchObject({
+      review_state: "READY",
+      completion_required: true,
+    });
+
+    completeWave(proj, "alpha");
+    const parentMemory = readFileSync(
+      join(
+        seededRecordDir(proj),
+        "construction",
+        "functional-design",
+        "memory.md",
+      ),
+      "utf-8",
+    );
+    expect(parentMemory).toContain(
+      "- 2026-08-12T00:00:00Z \u2014 preserve this note; verbatim context",
+    );
+    expect(parentMemory.match(/aidlc-wave-memory:alpha:/g)?.length).toBe(1);
+    expect(next(proj).directive.gate).toBe(true);
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("wave completion keeps absent diaries absent when learnings is off", () => {
+    const proj = project("functional-design", "stage-major", "none");
+    const state = seededStateFile(proj);
+    writeFileSync(state, readFileSync(state, "utf-8").replace(
+      "## Scope Configuration\n",
+      "## Scope Configuration\n- **Learnings**: off (set by you)\n",
+    ));
+    const installedTemplate = join(proj, ".claude", "knowledge", "aidlc-shared", "memory-template.md");
+    mkdirSync(dirname(installedTemplate), { recursive: true });
+    copyFileSync(join(AIDLC_SRC, "knowledge", "aidlc-shared", "memory-template.md"), installedTemplate);
+    seedBoltDag(proj, ["alpha"]);
+    cover(proj, "alpha", "functional-design", REQUIRED_FD);
+
+    const directive = next(proj).directive;
+    expect(directive.ceremony).toMatchObject({ learnings: "off" });
+    expect(directive.wave?.entries[0]).toMatchObject({
+      unit: "alpha",
+      review_state: "not-required",
+      completion_required: true,
+    });
+    const parentMemory = join(proj, directive.memory_path!);
+    const unitMemory = join(proj, directive.wave!.entries[0].unit_memory_path);
+    expect(existsSync(parentMemory)).toBe(false);
+    expect(existsSync(unitMemory)).toBe(false);
+
+    completeWave(proj, "alpha");
+    expect(auditEventCount(proj, "UNIT_COMPLETED")).toBe(1);
+    expect(existsSync(parentMemory)).toBe(false);
+    expect(existsSync(unitMemory)).toBe(false);
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test.each([
+    ["before the first receipt", false],
+    ["after one completion", true],
+  ] as const)(
+    "serial start/pause/resume preserve state and audit when next routes a wave (%s)",
+    (_label, priorCompletion) => {
+      const proj = project("functional-design", "stage-major", "none");
+      addRuntimeState(proj);
+      seedBoltDag(proj, ["alpha", "beta"], [["alpha"], ["beta"]]);
+      if (priorCompletion) {
+        cover(proj, "alpha", "functional-design", REQUIRED_FD);
+        completeWave(proj, "alpha");
+      }
+      expect(auditEventCount(proj, "UNIT_COMPLETED")).toBe(
+        priorCompletion ? 1 : 0,
+      );
+      const unit = priorCompletion ? "beta" : "alpha";
+      const routed = next(proj).directive;
+      expect(routed).toMatchObject({
+        kind: "run-stage",
+        stage: "functional-design",
+        unit,
+      });
+      expect(routed.wave?.entries.map((entry) => entry.unit)).toEqual([unit]);
+
+      for (const [action, extra] of [
+        ["start", []],
+        ["pause", ["--reason", "blocked", "--next-action", "resume later"]],
+        ["resume", []],
+      ] as ReadonlyArray<readonly [string, string[]]>) {
+        const stateBefore = readFileSync(seededStateFile(proj));
+        const auditBefore = auditBytes(proj);
+        const refused = unitVerbResult(proj, action, unit, extra);
+        expect(refused.status, `${action}: ${refused.out}`).not.toBe(0);
+        expect(refused.out).toContain("a wave is active");
+        expect(refused.out).toContain("complete --wave");
+        expect(refused.out).toContain("every remaining unit");
+        expect(readFileSync(seededStateFile(proj))).toEqual(stateBefore);
+        expect(auditBytes(proj)).toEqual(auditBefore);
+        const after = next(proj).directive;
+        expect(after).toMatchObject({
+          kind: "run-stage",
+          stage: "functional-design",
+          unit,
+        });
+        expect(after.wave).toEqual(routed.wave);
+      }
+
+      for (const remaining of priorCompletion ? ["beta"] : ["alpha", "beta"]) {
+        cover(proj, remaining, "functional-design", REQUIRED_FD);
+        completeWave(proj, remaining);
+      }
+      expect(next(proj).directive.gate).toBe(true);
+    },
+    NATIVE_FIXTURE_SETUP_TIMEOUT_MS,
+  );
+
+  test.each([
+    ["fresh wave", false],
+    ["rejected wave with one completion", true],
+  ] as const)(
+    "explicit unit-major selection allows the serial lifecycle (%s)",
+    (_label, rejectedWave) => {
+      const proj = project("functional-design", "stage-major", "none");
+      addRuntimeState(proj);
+      const file = seededStateFile(proj);
+      // Keep the focused plan on this stage when the unit-major walk resumes.
+      writeFileSync(
+        file,
+        readFileSync(file, "utf-8").replaceAll("- [ ]", "- [S]"),
+      );
+      seedBoltDag(proj, ["alpha", "beta"]);
+      appendAuditEntry("WORKFLOW_STARTED", { Scope: "feature" }, proj);
+      if (rejectedWave) {
+        appendAuditEntry("STAGE_STARTED", { Stage: "functional-design" }, proj);
+        appendAuditEntry("HUMAN_TURN", {}, proj);
+        const rejected = reportRejected(proj, "Revise the design");
+        expect(rejected.status, rejected.out).toBe(0);
+        expect(rejected.out).not.toContain('"kind":"error"');
+        expect(auditEventCount(proj, "GATE_REJECTED")).toBe(1);
+        cover(proj, "alpha", "functional-design", REQUIRED_FD);
+        completeWave(proj, "alpha");
+        expect(auditEventCount(proj, "UNIT_COMPLETED")).toBe(1);
+      }
+      const units = rejectedWave ? ["beta"] : ["alpha", "beta"];
+      expect(next(proj).directive.wave?.entries.map((entry) => entry.unit))
+        .toEqual(units);
+
+      approveIteration(proj, "functional-design", "unit-major");
+      const selected = stateCommand(proj, [
+        "set-construction-iteration",
+        "unit-major",
+      ]);
+      expect(selected.status, selected.out).toBe(0);
+      expect(readFileSync(file, "utf-8")).toContain(
+        "- **Construction Iteration**: unit-major",
+      );
+      for (const unit of units) {
+        const routed = next(proj).directive;
+        expect(routed).toMatchObject({
+          kind: "run-stage",
+          stage: "functional-design",
+          unit,
+        });
+        expect(routed.wave).toBeUndefined();
+        for (const [action, extra, event] of [
+          ["start", [], "UNIT_STARTED"],
+          [
+            "pause",
+            ["--reason", "blocked", "--next-action", "finish design"],
+            "UNIT_PAUSED",
+          ],
+          ["resume", [], "UNIT_RESUMED"],
+        ] as ReadonlyArray<readonly [string, string[], string]>) {
+          const result = unitVerbResult(proj, action, unit, extra);
+          expect(result.status, `${action}: ${result.out}`).toBe(0);
+          expect(result.out).toContain(event);
+          expect(activeUnitCheckpoint(proj, "functional-design")).toMatchObject({
+            unit,
+            state: action === "pause" ? "paused" : "in-progress",
+          });
+        }
+        cover(proj, unit, "functional-design", REQUIRED_FD);
+        const completed = unitVerbResult(proj, "complete", unit);
+        expect(completed.status, completed.out).toBe(0);
+        expect(completed.out).toContain("UNIT_COMPLETED");
+        expect(activeUnitCheckpoint(proj, "functional-design")).toBeNull();
+      }
+      const settled = next(proj).directive;
+      expect(settled.gate).toBe(true);
+      expect(settled.wave).toBeUndefined();
+    },
+    NATIVE_FIXTURE_SETUP_TIMEOUT_MS,
+  );
+
+  test("a wave on another stage does not block pausing or resuming a serial checkpoint", () => {
+    const proj = project("nfr-requirements", "unit-major", "none");
+    addRuntimeState(proj);
+    seedBoltDag(proj, ["alpha"]);
+    appendAuditEntry("WORKFLOW_STARTED", { Scope: "feature" }, proj);
+    const file = seededStateFile(proj);
+    writeFileSync(
+      file,
+      readFileSync(file, "utf-8").replace(
+        "- [ ] functional-design",
+        "- [x] functional-design",
+      ),
+    );
+    const started = unitVerbResult(proj, "start", "alpha", [], "nfr-requirements");
+    expect(started.status, started.out).toBe(0);
+    approveIteration(proj, "nfr-requirements", "stage-major");
+    const selected = stateCommand(proj, [
+      "set-construction-iteration",
+      "stage-major",
+    ]);
+    expect(selected.status, selected.out).toBe(0);
+    // Model a backward jump while the later stage keeps its serial checkpoint.
+    writeFileSync(
+      file,
+      readFileSync(file, "utf-8")
+        .replace("- [x] functional-design", "- [-] functional-design")
+        .replace("- [-] nfr-requirements", "- [ ] nfr-requirements")
+        .replace(
+          "- **Current Stage**: nfr-requirements",
+          "- **Current Stage**: functional-design",
+        ),
+    );
+    for (const [action, extra] of [
+      ["pause", ["--reason", "revisit design", "--next-action", "continue NFRs"]],
+      ["resume", []],
+    ] as ReadonlyArray<readonly [string, string[]]>) {
+      const routed = next(proj).directive;
+      expect(routed).toMatchObject({
+        kind: "run-stage",
+        stage: "functional-design",
+      });
+      expect(routed.wave?.entries.map((entry) => entry.unit)).toEqual(["alpha"]);
+      const result = unitVerbResult(
+        proj, action, "alpha", extra, "nfr-requirements",
+      );
+      expect(result.status, result.out).toBe(0);
+      expect(activeUnitCheckpoint(proj, "nfr-requirements")).toMatchObject({
+        unit: "alpha",
+        state: action === "pause" ? "paused" : "in-progress",
+      });
+      expect(next(proj).directive.wave).toEqual(routed.wave);
+    }
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("unit-major design and non-autonomous code-generation remain serial", () => {
+    const unitMajor = project("functional-design", "unit-major");
+    seedBoltDag(unitMajor, ["alpha", "beta"]);
+    expect(next(unitMajor).directive.wave).toBeUndefined();
+
+    const codegen = project("code-generation");
+    seedBoltDag(codegen, ["alpha", "beta"]);
+    const directive = next(codegen).directive;
+    expect(directive.stage).toBe("code-generation");
+    expect(directive.unit).toBe("alpha");
+    expect(directive.wave).toBeUndefined();
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+});
+
+function expectWaveProse(body: string): void {
+  expect(body).toContain("**Per-unit batch waves (optional).**");
+  expect(body).toContain("directive.wave");
+  expect(body).toContain(
+    "then `directive.wave` when present, otherwise `directive.gate`",
+  );
+  expect(body).toContain("parent Unit fields are only a projection");
+  expect(body).toContain("every `inline_context_paths` file");
+  expect(body).toContain("`context_warnings`");
+  expect(body).toContain("entry.required_produces");
+  expect(body).toContain("completion_required");
+  expect(body).toContain("entry.unit_memory_path");
+  expect(body).toContain("retry-required");
+  expect(body).toContain("repair-required");
+  expect(body).toContain("recovery-required");
+  expect(body).toContain("escalation-required");
+  expect(body).toContain("`--retry-pending`");
+  expect(body).toContain("emits `UNIT_COMPLETED`");
+  expect(body).toContain("Code Generation and unit-major iteration never carry a wave");
+  expect(body).not.toContain(
+    "read `bolt_dag.batches` from the intent's `runtime-graph.json`",
+  );
+}
+
+describe("t278 wave protocol parity", () => {
+  test("authored and generated conductor skills carry the current engine contract", () => {
+    for (const harness of HARNESS_MATRIX) {
+      const authored = readFileSync(
+        join(harness.authoredRoot, "skills", "aidlc", "SKILL.md"),
+        "utf-8",
+      );
+      const generated = readFileSync(
+        join(harness.skillsRoot, "aidlc", "SKILL.md"),
+        "utf-8",
+      );
+      expectWaveProse(authored);
+      expectWaveProse(generated);
+      if (harness.name === "kiro" || harness.name === "kiro-ide") {
+        for (const body of [authored, generated]) {
+          expect(body).toContain(
+            'Deliver the `load-steering` rule bundle per `stage-protocol.md` § "For subagent stages" step 2',
+          );
+          expect(body).toContain("native preload where one exists, verbatim paste otherwise");
+        }
+      } else {
+        expect(authored).toContain("complete steering bundle verbatim");
+        expect(generated).toContain("complete steering bundle verbatim");
+      }
+      expect(authored).toContain(
+        "Serialize reviews wherever the single reviewer-scope record is enforced",
+      );
+    }
+  });
+
+  test("shared protocol carries the engine, receipt, steering, and memory invariants", () => {
+    const core = readFileSync(
+      join(
+        import.meta.dir,
+        "..",
+        "..",
+        "core",
+        "aidlc-common",
+        "protocols",
+        "stage-protocol-construction.md",
+      ),
+      "utf-8",
+    );
+    expect(core).toContain(
+      "**Per-unit batch waves (optional, stage-major only).**",
+    );
+    expect(core).toContain("engine may emit `directive.wave`");
+    expect(core).toContain(
+      "branch on it before the ordinary per-Unit or gate path",
+    );
+    expect(core).toContain("entry.required_produces");
+    expect(core).toContain("completion_required");
+    expect(core).toContain("`unit_memory_path`");
+    expect(core).toContain('"retry-required"');
+    expect(core).toContain('"repair-required"');
+    expect(core).toContain('"recovery-required"');
+    expect(core).toContain('"escalation-required"');
+    expect(core).toContain("unit complete --wave");
+    expect(core).toContain("UNIT_COMPLETED");
+    expect(core).toContain("accumulated steering bundle");
+    expect(core).toContain(
+      'Deliver the `load-steering` rule bundle per `stage-protocol.md` § "For subagent stages" step 2',
+    );
+    expect(core).toContain("native preload where one exists, verbatim paste otherwise");
+    expect(core).not.toContain(
+      "read `bolt_dag.batches` from the intent's `runtime-graph.json`",
+    );
+  });
+});

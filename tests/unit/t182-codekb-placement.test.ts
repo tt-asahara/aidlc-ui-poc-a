@@ -1,0 +1,501 @@
+// covers: function:codekbDir, function:relativeCodekbDir, function:codekbRepoName, subcommand:aidlc-utility:codekb-path
+//
+// t182 — codekb placement (deterministic, no-LLM). The fast-tier guard for the
+// codekb-determinism effort: it pins the SPACE-LEVEL placement the engine now
+// resolves for the reverse-engineering stage's artifacts —
+// `aidlc/spaces/<space>/codekb/<repo>/` — at three layers, with ZERO tokens.
+//
+//   1. The PURE lib helpers (imported in-process from the shipped dist tree):
+//      relativeCodekbDir / codekbDir compose the space-level per-repo dir, and
+//      codekbRepoName picks the deterministic repo NAME (0 recorded → basename,
+//      or the lone store a moved folder was written under; 1 → that name,
+//      >1 → basename fallback).
+//   2. The `codekb-path` UTILITY VERB (spawned as the real CLI surface): it prints
+//      exactly what relativeCodekbDir composes, honouring --repo and --json.
+//   3. The isCodekb RESOLVER BRANCH (observed on the run-stage directive the
+//      spawned engine emits): a brownfield reverse-engineering directive resolves
+//      its produces[]/consumes[] under the space-level codekb dir, NOT the
+//      per-intent record dir.
+//
+// MECHANISM = cli. The lib helpers are EXPORTED (importable in-process, the
+// `none` floor), but the `codekb-path` subcommand is an argv-dispatch surface
+// whose guarantee-principle minMechanism is `cli` — only a SPAWNED tool proves it
+// routes. This file spawns BOTH `aidlc-utility.ts codekb-path` and
+// `aidlc-orchestrate.ts next` (the t116 vehicle), so gen-coverage-registry.ts
+// derives `cli` from the body and the subcommand claim clears its bar while the
+// three function claims clear `none`.
+//
+// FIXTURE DISCIPLINE mirrors t116: a fresh temp project per spawn (createTestProject
+// seeds ONE default intent with NO repos row), cleaned in afterAll. With no repos
+// recorded, codekbRepoName(proj) === basename(proj), so the resolved repo segment
+// is the temp dir's basename — captured per-emit, not hard-coded.
+
+import {
+  NATIVE_MULTI_WORKTREE_CASE_TIMEOUT_MS,
+  NATIVE_STARTUP_TIMEOUT_MS,
+  remainingOperationTimeoutMs,
+} from "../harness/test-budget.ts";
+import { afterAll, describe, expect, test, setDefaultTimeout } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+import {
+  cleanupTestProject,
+  cleanupWorktreeFixture,
+  createTestProject,
+  DEFAULT_SPACE,
+  resetAidlcEnv,
+  runOrchestrateNext,
+  seedAidlcMemory,
+  seededStateFile,
+  seedStateFile,
+  sedReplaceInFile,
+  setupWorktreeFixture,
+} from "../harness/fixtures.ts";
+import {
+  codekbDir,
+  codekbRepoName,
+  relativeCodekbDir,
+} from "../../dist/claude/.claude/tools/aidlc-lib.ts";
+
+setDefaultTimeout(NATIVE_MULTI_WORKTREE_CASE_TIMEOUT_MS);
+
+const BUN = process.execPath; // the bun running this test
+const REPO_ROOT = join(import.meta.dir, "..", "..");
+const TOOLS = join(REPO_ROOT, "dist", "claude", ".claude", "tools");
+const UTILITY = join(TOOLS, "aidlc-utility.ts");
+const ORCH = join(TOOLS, "aidlc-orchestrate.ts");
+const FIXTURES_DIR = join(REPO_ROOT, "tests", "fixtures");
+
+// Clear AWS_AIDLC_DEFAULT_SCOPE so a leaked shell export can't shadow the fixture
+// scope (the same reset t116 does).
+resetAidlcEnv();
+
+const tempDirs: string[] = [];
+afterAll(() => {
+  for (const d of tempDirs) cleanupTestProject(d);
+});
+
+function freshProject(): string {
+  const proj = createTestProject();
+  tempDirs.push(proj);
+  return proj;
+}
+
+// A fresh project whose ACTIVE-intent cursor actually resolves: createTestProject
+// seeds the registry row + cursor but NO aidlc-state.md, and activeIntent only
+// honours the cursor when the record dir holds a state file (aidlc-lib.ts
+// activeIntent). Seeding one makes intentRepos read the recorded row, so the
+// codekbRepoName cases below exercise the real registry path, not the null-cursor
+// fallback. The fixture's repos field stays absent until rewriteIntentRepos sets it.
+function seedRecordedIntent(): string {
+  const proj = freshProject();
+  seedStateFile(proj, join(FIXTURES_DIR, "state-brownfield-feature.md"));
+  return proj;
+}
+
+const childEnv = (): NodeJS.ProcessEnv => {
+  const e = { ...process.env };
+  delete e.AWS_AIDLC_DEFAULT_SCOPE;
+  return e;
+};
+
+// ============================================================================
+// 1. The PURE lib helpers — space-level shape (imported in-process).
+// ============================================================================
+describe("t182 codekb lib helpers — space-level per-repo placement", () => {
+  test("relativeCodekbDir(proj, repo, space) === aidlc/spaces/<space>/codekb/<repo>", () => {
+    const proj = freshProject();
+    expect(relativeCodekbDir(proj, "repo-x", DEFAULT_SPACE)).toBe(
+      `aidlc/spaces/${DEFAULT_SPACE}/codekb/repo-x`,
+    );
+  });
+
+  test("codekbDir(proj, repo, space) ends with the join of spaces/<space>/codekb/<repo>", () => {
+    const proj = freshProject();
+    const tail = join("spaces", DEFAULT_SPACE, "codekb", "repo-x");
+    expect(codekbDir(proj, "repo-x", DEFAULT_SPACE).endsWith(tail)).toBe(true);
+  });
+
+  test("relativeCodekbDir defaults the space to the active-space cursor (default)", () => {
+    const proj = freshProject(); // the fixture cursor is `default`
+    expect(relativeCodekbDir(proj, "repo-x")).toBe(
+      `aidlc/spaces/${DEFAULT_SPACE}/codekb/repo-x`,
+    );
+  });
+
+  // codekbRepoName resolves the recorded repo set via intentRepos, which keys off
+  // the ACTIVE intent — and activeIntent only honours the cursor when the record
+  // dir holds an aidlc-state.md (aidlc-lib.ts activeIntent). So these cases seed a
+  // state file first (seedRecordedIntent) so the cursor resolves to the row whose
+  // repos we then rewrite; without it intentRepos returns [] for the wrong reason.
+
+  // codekbRepoName: 0 recorded repos -> basename(projectDir). The seeded row has
+  // NO repos field (the genuine 0-repo case, cursor resolving).
+  test("codekbRepoName: 0 recorded repos → basename(projectDir)", () => {
+    const proj = seedRecordedIntent(); // active row present, no repos field
+    expect(codekbRepoName(proj, DEFAULT_SPACE)).toBe(basename(proj));
+  });
+
+  // codekbRepoName: exactly 1 recorded repo -> that repo name.
+  test("codekbRepoName: 1 recorded repo → that name", () => {
+    const proj = seedRecordedIntent();
+    rewriteIntentRepos(proj, ["only-repo"]);
+    expect(codekbRepoName(proj, DEFAULT_SPACE)).toBe("only-repo");
+  });
+
+  // codekbRepoName: >1 recorded repos -> basename(projectDir) (the safe default;
+  // a caller that knows the repo passes --repo explicitly).
+  test("codekbRepoName: >1 recorded repos → basename(projectDir)", () => {
+    const proj = seedRecordedIntent();
+    rewriteIntentRepos(proj, ["repo-a", "repo-b"]);
+    expect(codekbRepoName(proj, DEFAULT_SPACE)).toBe(basename(proj));
+  });
+
+  // A moved, renamed or copied folder: the store was written under the folder's
+  // earlier name, and nothing in the space carries the current one.
+  test("codekbRepoName: a moved folder keeps the store it was written in", () => {
+    const proj = seedRecordedIntent();
+    seedStore(proj, "earlier-name");
+    expect(codekbRepoName(proj, DEFAULT_SPACE)).toBe("earlier-name");
+  });
+
+  test("codekbRepoName: a store under the current name wins over an older one", () => {
+    const proj = seedRecordedIntent();
+    seedStore(proj, "earlier-name");
+    seedStore(proj, basename(proj));
+    expect(codekbRepoName(proj, DEFAULT_SPACE)).toBe(basename(proj));
+  });
+
+  test("codekbRepoName: a store another intent recorded as its repo is not taken", () => {
+    const proj = seedRecordedIntent();
+    seedStore(proj, "svc");
+    seedStore(proj, "earlier-name");
+    appendIntentRow(proj, ["svc"]);
+    expect(codekbRepoName(proj, DEFAULT_SPACE)).toBe("earlier-name");
+  });
+
+  // Without the active intent's registry row, nothing says which stores other
+  // intents' repos own, so a lone store is not taken.
+  test("codekbRepoName: a missing or damaged registry keeps the current name", () => {
+    for (const registry of [null, "{not json\n", "[]\n"]) {
+      const proj = seedRecordedIntent();
+      seedStore(proj, "other-repo");
+      const regPath = join(proj, "aidlc", "spaces", DEFAULT_SPACE, "intents", "intents.json");
+      if (registry === null) rmSync(regPath);
+      else writeFileSync(regPath, registry, "utf-8");
+      expect(codekbRepoName(proj, DEFAULT_SPACE)).toBe(basename(proj));
+    }
+    // The active row is fine, but a later entry is not.
+    for (const bad of [null, "row", { slug: "other", repos: "svc" }]) {
+      const proj = seedRecordedIntent();
+      seedStore(proj, "other-repo");
+      const regPath = join(proj, "aidlc", "spaces", DEFAULT_SPACE, "intents", "intents.json");
+      const rows = JSON.parse(readFileSync(regPath, "utf-8")) as unknown[];
+      rows.push(bad);
+      writeFileSync(regPath, `${JSON.stringify(rows)}\n`, "utf-8");
+      expect(codekbRepoName(proj, DEFAULT_SPACE)).toBe(basename(proj));
+    }
+  });
+
+  test("codekbRepoName: two unclaimed stores are ambiguous and keep the current name", () => {
+    const proj = seedRecordedIntent();
+    seedStore(proj, "name-a");
+    seedStore(proj, "name-b");
+    expect(codekbRepoName(proj, DEFAULT_SPACE)).toBe(basename(proj));
+  });
+});
+
+// ============================================================================
+// 2. The `codekb-path` VERB — the real CLI surface (spawned). Prints exactly
+//    what relativeCodekbDir composes; honours --repo and --json.
+// ============================================================================
+describe("t182 codekb-path verb — prints the space-level per-repo dir", () => {
+  test("codekb-path --repo <name> prints aidlc/spaces/<space>/codekb/<repo>/", () => {
+    const proj = freshProject();
+    const res = spawnSync(BUN, [UTILITY, "codekb-path", "--project-dir", proj, "--repo", "svc"], {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      encoding: "utf-8",
+      env: childEnv(),
+    });
+    expect(res.status).toBe(0);
+    expect(res.stdout.trim()).toBe(`aidlc/spaces/${DEFAULT_SPACE}/codekb/svc/`);
+  });
+
+  test("codekb-path --json carries {space, repo, dir} matching relativeCodekbDir", () => {
+    const proj = freshProject();
+    const res = spawnSync(
+      BUN,
+      [UTILITY, "codekb-path", "--project-dir", proj, "--repo", "svc", "--json"],
+      { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8", env: childEnv() },
+    );
+    expect(res.status).toBe(0);
+    const parsed = JSON.parse(res.stdout.trim()) as {
+      space: string;
+      repo: string;
+      dir: string;
+    };
+    expect(parsed.space).toBe(DEFAULT_SPACE);
+    expect(parsed.repo).toBe("svc");
+    expect(parsed.dir).toBe(relativeCodekbDir(proj, "svc", DEFAULT_SPACE));
+  });
+
+  test("codekb-path with NO --repo resolves codekbRepoName (0 repos → basename)", () => {
+    const proj = freshProject();
+    const res = spawnSync(BUN, [UTILITY, "codekb-path", "--project-dir", proj], {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      encoding: "utf-8",
+      env: childEnv(),
+    });
+    expect(res.status).toBe(0);
+    expect(res.stdout.trim()).toBe(
+      `aidlc/spaces/${DEFAULT_SPACE}/codekb/${basename(proj)}/`,
+    );
+  });
+});
+
+// ============================================================================
+// 3. The isCodekb RESOLVER BRANCH — observed on the emitted run-stage directive.
+//    A brownfield reverse-engineering directive resolves its artifacts under the
+//    space-level codekb dir, NOT the per-intent record dir. Vehicle = the t116
+//    emitFor pattern (seed a brownfield fixture, pivot Current Stage to
+//    reverse-engineering, flip its checkbox in-flight, run bare `next`).
+// ============================================================================
+interface RunStageDirective {
+  kind: string;
+  stage: string;
+  consumes: string[];
+  produces: string[];
+}
+
+function emitReverseEngineering(
+  repos: string[] = [],
+): { dir: RunStageDirective; proj: string } {
+  const proj = freshProject();
+  seedAidlcMemory(proj);
+  seedStateFile(proj, join(FIXTURES_DIR, "state-brownfield-feature.md"));
+  if (repos.length > 0) rewriteIntentRepos(proj, repos);
+  const state = seededStateFile(proj);
+  sedReplaceInFile(
+    state,
+    /^- \*\*Current Stage\*\*:.*$/m,
+    `- **Current Stage**: reverse-engineering`,
+  );
+  sedReplaceInFile(
+    state,
+    /^- \[.\] reverse-engineering — EXECUTE/m,
+    `- [-] reverse-engineering — EXECUTE`,
+  );
+  const res = runOrchestrateNext(ORCH, proj, [], { env: childEnv() });
+  const out = res.out;
+  let dir: RunStageDirective;
+  try {
+    dir = JSON.parse(res.stdout.trim());
+  } catch {
+    throw new Error(
+      `emitReverseEngineering did not emit parseable JSON. status=${res.status}\n${out}`,
+    );
+  }
+  expect(dir.kind).toBe("run-stage");
+  expect(dir.stage).toBe("reverse-engineering");
+  return { dir, proj };
+}
+
+describe("t182 isCodekb resolver — reverse-engineering artifacts land under space-level codekb", () => {
+  test("every reverse-engineering produces resolves under aidlc/spaces/<space>/codekb/<repo>/ (NOT the record dir)", () => {
+    const { dir, proj } = emitReverseEngineering();
+    // 0 recorded repos → the resolver keys codekbRepoName = basename(proj).
+    const codekbPrefix = `${relativeCodekbDir(proj, basename(proj), DEFAULT_SPACE)}/`;
+    expect(dir.produces.length).toBeGreaterThan(0);
+    for (const p of dir.produces) {
+      expect(p.startsWith(codekbPrefix), `produces ${p} not under codekb`).toBe(true);
+      // It must NOT carry the per-intent record tail the OLD placement used.
+      expect(p.includes("/intents/")).toBe(false);
+      expect(p.includes("/inception/reverse-engineering/")).toBe(false);
+    }
+  });
+
+  test("the 9 RE artifacts resolve to space-level codekb (architecture.md, component-inventory.md, …)", () => {
+    const { dir, proj } = emitReverseEngineering();
+    const codekbPrefix = `${relativeCodekbDir(proj, basename(proj), DEFAULT_SPACE)}/`;
+    for (const stem of ["architecture", "component-inventory", "reverse-engineering-timestamp"]) {
+      expect(dir.produces).toContain(`${codekbPrefix}${stem}.md`);
+    }
+  });
+
+  test("multi-repo reverse-engineering enumerates the full produces set under every registered repo", () => {
+    const repos = ["repo-a", "repo-b"];
+    const { dir, proj } = emitReverseEngineering(repos);
+    expect(dir.produces).toHaveLength(18);
+    for (const repo of repos) {
+      const prefix = `${relativeCodekbDir(proj, repo, DEFAULT_SPACE)}/`;
+      expect(dir.produces.filter((path) => path.startsWith(prefix))).toHaveLength(9);
+      expect(dir.produces).toContain(`${prefix}architecture.md`);
+      expect(dir.produces).toContain(`${prefix}reverse-engineering-timestamp.md`);
+    }
+    expect(
+      dir.produces.some((path) =>
+        path.includes(`/codekb/${basename(proj)}/`)
+      ),
+    ).toBe(false);
+  });
+
+  // The folder was moved after Reverse Engineering wrote its store under the
+  // folder's earlier name: the next stage still reads that store, and
+  // `codekb-path` names it.
+  test("after a folder move, the next stage reads the store Reverse Engineering wrote", () => {
+    const proj = freshProject();
+    seedAidlcMemory(proj);
+    seedStateFile(proj, join(FIXTURES_DIR, "state-brownfield-feature.md"));
+    seedStore(proj, "shop-app");
+    const res = runOrchestrateNext(ORCH, proj, [], { env: childEnv() });
+    const dir = JSON.parse(res.stdout.trim()) as RunStageDirective;
+    expect(dir.kind).toBe("run-stage");
+    expect(dir.stage).toBe("requirements-analysis");
+    const store = `aidlc/spaces/${DEFAULT_SPACE}/codekb/shop-app/`;
+    expect(dir.consumes).toContain(`${store}architecture.md`);
+    expect(dir.consumes.some((path) => path.includes(`/codekb/${basename(proj)}/`))).toBe(false);
+    const path = spawnSync(BUN, [UTILITY, "codekb-path", "--project-dir", proj], {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      encoding: "utf-8",
+      env: childEnv(),
+    });
+    expect(path.status).toBe(0);
+    expect(path.stdout.trim()).toBe(store);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Helper: overwrite the seeded intent's `repos` row in intents.json so
+// codekbRepoName reads the recorded set. Mirrors how the fixture seeds the
+// registry (one row, slug derived from DEFAULT_RECORD_DIR) — we only add/replace
+// the `repos` array on that lone row.
+// ---------------------------------------------------------------------------
+function rewriteIntentRepos(proj: string, repos: string[]): void {
+  const regPath = join(proj, "aidlc", "spaces", DEFAULT_SPACE, "intents", "intents.json");
+  const rows = JSON.parse(readFileSync(regPath, "utf-8")) as Array<Record<string, unknown>>;
+  rows[0].repos = repos;
+  writeFileSync(regPath, `${JSON.stringify(rows, null, 2)}\n`, "utf-8");
+}
+
+// A second, inactive intent row that recorded its own repos.
+function appendIntentRow(proj: string, repos: string[]): void {
+  const regPath = join(proj, "aidlc", "spaces", DEFAULT_SPACE, "intents", "intents.json");
+  const rows = JSON.parse(readFileSync(regPath, "utf-8")) as Array<Record<string, unknown>>;
+  rows.push({ uuid: "other-uuid", slug: "other", dirName: "other", status: "in-flight", repos });
+  writeFileSync(regPath, `${JSON.stringify(rows, null, 2)}\n`, "utf-8");
+}
+
+// A code knowledge base store with one artifact in it.
+function seedStore(proj: string, repo: string): void {
+  const dir = join(proj, "aidlc", "spaces", DEFAULT_SPACE, "codekb", repo);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "architecture.md"), `# ${repo}\n`, "utf-8");
+}
+
+// ============================================================================
+// 4. LINKED WORKTREE identity. With nothing recorded, the repo name must come
+// from the MAIN checkout, not from the directory the caller happens to stand in:
+// `git worktree add` names its directory after a BRANCH, so basename(projectDir)
+// there is a branch name and the store lands beside the repository's real store
+// instead of in it. The gate reads the same resolver, so a store written under
+// the true repository name is invisible to it and reverse-engineering cannot be
+// approved (the defect this case pins).
+//
+// Mechanism: a real `git worktree add` off the fixture repo, then codekbRepoName
+// in-process from inside the worktree. The control asserts the main checkout is
+// unchanged, which is the backwards-compatibility claim: outside a linked
+// worktree, dirname(--git-common-dir) IS projectDir, so nothing moves.
+// ============================================================================
+describe("t182 codekb repo name — project root inside a linked git worktree", () => {
+  const repo = setupWorktreeFixture();
+  const repoName = basename(repo);
+  const linked = join(dirname(repo), `${repoName}-feature-x`);
+  const added = spawnSync(
+    "git",
+    ["worktree", "add", "-q", linked, "-b", "feature-x"],
+    { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), cwd: repo, encoding: "utf-8" },
+  );
+
+  afterAll(() => cleanupWorktreeFixture(repo));
+
+  test("git worktree add succeeded (fixture precondition)", () => {
+    expect(added.status, added.stderr).toBe(0);
+  });
+
+  test("codekbRepoName from the linked worktree resolves the REPOSITORY name", () => {
+    // Not basename(linked) — that is `<repo>-feature-x`, a branch-derived name.
+    expect(codekbRepoName(linked)).toBe(repoName);
+  });
+
+  test("codekbRepoName from the main checkout is unchanged (no-op outside worktrees)", () => {
+    expect(codekbRepoName(repo)).toBe(repoName);
+  });
+
+  test("both checkouts therefore resolve to ONE codekb store", () => {
+    expect(relativeCodekbDir(linked, codekbRepoName(linked), DEFAULT_SPACE)).toBe(
+      relativeCodekbDir(repo, codekbRepoName(repo), DEFAULT_SPACE),
+    );
+  });
+
+  test("a SUBDIRECTORY of the linked worktree also resolves the repository name", () => {
+    const deep = join(linked, "pkg", "service");
+    mkdirSync(deep, { recursive: true });
+    expect(codekbRepoName(deep)).toBe(repoName);
+  });
+});
+
+// ============================================================================
+// 5. Topologies that must keep basename(projectDir) EXACTLY as before. The repo
+// name is read from `--git-common-dir`, which git answers RELATIVE TO THE
+// DIRECTORY IT WAS MEASURED IN. Resolving it against `--show-toplevel` instead
+// climbs above the repository whenever the project root sits below the toplevel,
+// and if a git dir happens to sit at that level the resolver would return a
+// DIFFERENT repository's name — silently, since the path exists so no fallback
+// fires. Both cases below are that shape; `--git-dir` === `--git-common-dir`
+// identifies them (only a linked worktree has those differ), so both keep today's
+// answer.
+// ============================================================================
+describe("t182 codekb repo name — project root below the git toplevel keeps basename", () => {
+  const roots: string[] = [];
+  afterAll(() => {
+    for (const r of roots) rmSync(r, { recursive: true, force: true });
+  });
+
+  const gitInitAt = (dir: string): void => {
+    mkdirSync(dir, { recursive: true });
+    for (const args of [
+      ["init", "-q"],
+      ["config", "user.email", "t@x"],
+      ["config", "user.name", "t"],
+    ]) {
+      const r = spawnSync("git", args, { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), cwd: dir, encoding: "utf-8" });
+      if (r.status !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr?.trim()}`);
+    }
+  };
+
+  test("a subdirectory of a plain checkout resolves to the SUBDIRECTORY name", () => {
+    const root = mkdtempSync(join(tmpdir(), "t182-subdir-"));
+    roots.push(root);
+    gitInitAt(root);
+    const sub = join(root, "packages", "service");
+    mkdirSync(sub, { recursive: true });
+    // Unchanged behaviour: the project root names itself, not the repository.
+    expect(codekbRepoName(sub)).toBe("service");
+  });
+
+  test("a repository nested in another does NOT resolve to the OUTER repository", () => {
+    const base = mkdtempSync(join(tmpdir(), "t182-nested-"));
+    roots.push(base);
+    gitInitAt(join(base, "outer"));
+    gitInitAt(join(base, "outer", "inner"));
+    const projectRoot = join(base, "outer", "inner", "sub");
+    mkdirSync(projectRoot, { recursive: true });
+    // `--git-common-dir` from here is `../.git` — relative to THIS dir, i.e.
+    // inner/.git. Resolved against the toplevel it would become outer/.git, which
+    // exists, so a toplevel-relative resolver answers "outer".
+    expect(codekbRepoName(projectRoot)).not.toBe("outer");
+    expect(codekbRepoName(projectRoot)).toBe("sub");
+  });
+});

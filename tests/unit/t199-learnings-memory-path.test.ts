@@ -1,0 +1,497 @@
+// covers: subcommand:aidlc-runtime:compile, subcommand:aidlc-learnings:surface, subcommand:aidlc-log:decision
+//
+// t199 - the per-intent memory path is recorded (write side) and read (read
+// side) across the workspace layout.
+//
+// Mechanism: cli. Both sides are exercised by spawning the shipped tools through
+// the bun runtime: `aidlc-runtime compile` writes the runtime-graph.json rows,
+// `aidlc-learnings surface` reads a row's memory_path and derives the phase. The
+// process boundary plus the bytes on disk are the subject; an in-process twin
+// would lose the record-cursor resolution the tools do against the project tree.
+//
+// TWO DEFECTS PINNED (both made `learnings surface` dead under the workspace
+// layout):
+//   WRITE SIDE - compile recorded memory_path as `<bare-space-prefix>/<phase>/
+//     <slug>/memory.md`, dropping the active intent's record dir
+//     (aidlc/spaces/<sp>/intents/<slug>-<id8>). The state advance transition had
+//     the same 2-arg relativeMemoryPath call. surface then join()'d that against
+//     projectDir and missed the real diary, surfacing zero candidates.
+//   READ SIDE - surface extracted the phase as memRel.split("/")[1], which under
+//     the workspace prefix is "spaces", not the real phase. The robust extraction
+//     is the third-from-last segment: memory_path always ends
+//     `<prefix>/<phase>/<stageSlug>/memory.md` regardless of prefix shape.
+//
+// The legacy flat path `aidlc-docs/<phase>/<slug>/memory.md` shares that tail, so
+// the read-side fix degrades correctly there too - the third case pins it.
+//
+// A THIRD DEFECT PINNED - surface hard-failed when runtime-graph.json did not
+// exist at all. Only the rebuild-stage-graph hook writes that (gitignored,
+// machine-local) file, and only on a transition-class command; §13 runs BEFORE
+// the `orchestrate report --result awaiting-approval` that is the first such
+// command in a workflow, so the FIRST gated stage always found it absent and the
+// mandatory ritual was stranded behind a bare "not found". surface now recomputes
+// memory_path exactly as compile derives it, quietly. The absence cases below
+// therefore deliberately skip compile; a malformed graph must still fail.
+//
+// Source under test (dist/claude/.claude/tools/):
+//   aidlc-runtime.ts compile      - the runtime-graph row's memory_path.
+//   aidlc-learnings.ts surface    - the phase extraction + diary read.
+
+import {
+  NATIVE_MULTI_WORKTREE_CASE_TIMEOUT_MS,
+  NATIVE_STARTUP_TIMEOUT_MS,
+  remainingOperationTimeoutMs,
+} from "../harness/test-budget.ts";
+import { afterAll, describe, expect, test, setDefaultTimeout } from "bun:test";
+import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import {
+  AIDLC_SRC,
+  createTestProject,
+  DEFAULT_RECORD_DIR,
+  DEFAULT_SPACE,
+  seededAuditShard,
+  seededRecordDir,
+  seededStateFile,
+} from "../harness/fixtures.ts";
+import {
+  createIntent,
+  setActiveIntentCursor,
+  writeSessionBinding,
+} from "../../dist/claude/.claude/tools/aidlc-lib.ts";
+
+setDefaultTimeout(NATIVE_MULTI_WORKTREE_CASE_TIMEOUT_MS);
+
+const BUN = process.execPath; // the bun running this test
+const RUNTIME_TS = join(AIDLC_SRC, "tools", "aidlc-runtime.ts");
+const LEARNINGS_TS = join(AIDLC_SRC, "tools", "aidlc-learnings.ts");
+const LOG_TS = join(AIDLC_SRC, "tools", "aidlc-log.ts");
+
+// The active intent's RELATIVE record prefix a seeded workspace project resolves
+// (createTestProject seeds the active-intent cursor at DEFAULT_RECORD_DIR).
+const RP = `aidlc/spaces/${DEFAULT_SPACE}/intents/${DEFAULT_RECORD_DIR}`;
+
+const projects: string[] = [];
+afterAll(() => {
+  for (const p of projects) rmSync(p, { recursive: true, force: true });
+});
+
+/** A minimal audit shard: one WORKFLOW_STARTED + one STAGE_STARTED for a stage
+ *  whose phase the stage-graph knows (user-stories -> inception). */
+function auditShard(): string {
+  return [
+    "# AI-DLC Audit Log",
+    "",
+    "## Workflow Started",
+    "**Timestamp**: 2026-05-28T08:00:00Z",
+    "**Event**: WORKFLOW_STARTED",
+    "**Workflow ID**: t199",
+    "**Scope**: feature",
+    "",
+    "---",
+    "",
+    "## Stage Started",
+    "**Timestamp**: 2026-05-28T08:01:00Z",
+    "**Event**: STAGE_STARTED",
+    "**Stage**: user-stories",
+    "**Agent**: aidlc-product-agent",
+    "",
+    "---",
+    "",
+  ].join("\n");
+}
+
+/** Seed a per-intent workspace project with the state + audit compile needs. */
+function mkWorkspaceProject(): string {
+  const pd = createTestProject();
+  projects.push(pd);
+  const rec = seededRecordDir(pd);
+  mkdirSync(rec, { recursive: true });
+  writeFileSync(
+    seededStateFile(pd),
+    "# AI-DLC State Tracking\n- **Current Stage**: user-stories\n- **Scope**: feature\n",
+  );
+  const shard = seededAuditShard(pd);
+  mkdirSync(join(rec, "audit"), { recursive: true });
+  writeFileSync(shard, auditShard());
+  return pd;
+}
+
+/** memory.md with one Interpretations entry so surface yields a candidate only
+ *  when it resolved the diary at the right path. */
+function memoryDiary(): string {
+  // parseMemoryEntryLine counts any non-empty line under a heading as one entry
+  // (a canonical `<ts> - <text>` bullet is parsed further, a bare line degrades
+  // to a raw entry), so this single bullet yields exactly one candidate.
+  return [
+    "## Interpretations",
+    "- Reused the existing auth module; saved a rewrite this stage",
+    "",
+  ].join("\n");
+}
+
+const TIMEOUT = NATIVE_MULTI_WORKTREE_CASE_TIMEOUT_MS;
+
+describe("t199 per-intent memory path (write + read)", () => {
+  // ===========================================================================
+  // WRITE SIDE - compile records memory_path WITH the per-intent record dir.
+  // ===========================================================================
+  test("compile records a memory_path that includes the per-intent record dir", () => {
+    const pd = mkWorkspaceProject();
+    const r = spawnSync(BUN, [RUNTIME_TS, "--project-dir", pd, "compile"], {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      encoding: "utf-8",
+    });
+    expect(r.status).toBe(0);
+    const graph = JSON.parse(
+      readFileSync(join(seededRecordDir(pd), "runtime-graph.json"), "utf-8"),
+    );
+    const row = graph.stages.find(
+      (s: { stage_slug: string }) => s.stage_slug === "user-stories",
+    );
+    expect(row).toBeDefined();
+    // The row's memory_path carries the active intent's record dir, not the bare
+    // space prefix - so join(projectDir, memory_path) points at the real diary.
+    expect(row.memory_path).toBe(`${RP}/inception/user-stories/memory.md`);
+  }, TIMEOUT);
+
+  // ===========================================================================
+  // READ SIDE - surface finds the diary + derives the phase under the workspace
+  // layout. Drives the write side first so the row is real, then seeds the diary
+  // at the recorded path.
+  // ===========================================================================
+  test("surface finds the diary and reports the correct phase under the workspace layout", () => {
+    const pd = mkWorkspaceProject();
+    expect(
+      spawnSync(BUN, [RUNTIME_TS, "--project-dir", pd, "compile"], {
+        timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+        encoding: "utf-8",
+      }).status,
+    ).toBe(0);
+    // Seed memory.md at the per-intent record path the row now records.
+    const diaryDir = join(seededRecordDir(pd), "inception", "user-stories");
+    mkdirSync(diaryDir, { recursive: true });
+    writeFileSync(join(diaryDir, "memory.md"), memoryDiary());
+
+    const s = spawnSync(
+      BUN,
+      [LEARNINGS_TS, "surface", "--slug", "user-stories", "--project-dir", pd],
+      { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" },
+    );
+    expect(s.status).toBe(0);
+    const out = JSON.parse(s.stdout);
+    // The phase is the real one (inception), NOT "spaces" (the old front-index bug).
+    expect(out.phase).toBe("inception");
+    // The diary was resolved: one Interpretations entry -> one candidate.
+    expect(out.candidates.length).toBe(1);
+  }, TIMEOUT);
+
+  test("surface uses the session binding when the shared cursor points elsewhere", () => {
+    const pd = mkWorkspaceProject();
+    expect(
+      spawnSync(BUN, [RUNTIME_TS, "--project-dir", pd, "compile"], {
+        timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+        encoding: "utf-8",
+      }).status,
+    ).toBe(0);
+    const boundDiary = join(
+      seededRecordDir(pd),
+      "inception",
+      "user-stories",
+      "memory.md",
+    );
+    mkdirSync(dirname(boundDiary), { recursive: true });
+    writeFileSync(boundDiary, memoryDiary());
+
+    const other = createIntent(pd, "cursor-other", DEFAULT_SPACE, "feature");
+    const otherRecord = join(
+      pd,
+      "aidlc",
+      "spaces",
+      DEFAULT_SPACE,
+      "intents",
+      other.dirName,
+    );
+    writeFileSync(
+      join(otherRecord, "aidlc-state.md"),
+      "# AI-DLC State Tracking\n- **Current Stage**: user-stories\n- **Scope**: feature\n",
+    );
+    writeFileSync(
+      join(otherRecord, "runtime-graph.json"),
+      JSON.stringify({
+        stages: [{
+          stage_slug: "user-stories",
+          memory_path:
+            `aidlc/spaces/${DEFAULT_SPACE}/intents/${other.dirName}/inception/user-stories/memory.md`,
+        }],
+      }),
+    );
+    const otherDiary = join(
+      otherRecord,
+      "inception",
+      "user-stories",
+      "memory.md",
+    );
+    mkdirSync(dirname(otherDiary), { recursive: true });
+    writeFileSync(
+      otherDiary,
+      "## Interpretations\n- This belongs to the shared cursor only\n",
+    );
+    writeSessionBinding(pd, "session-a", DEFAULT_SPACE, DEFAULT_RECORD_DIR, "switch");
+    setActiveIntentCursor(pd, other.dirName, DEFAULT_SPACE);
+
+    const surfaced = spawnSync(
+      BUN,
+      [LEARNINGS_TS, "surface", "--slug", "user-stories", "--project-dir", pd],
+      {
+        timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+        encoding: "utf-8",
+        env: { ...process.env, AIDLC_SESSION_OVERRIDE: "session-a" },
+      },
+    );
+    expect(surfaced.status, surfaced.stderr).toBe(0);
+    const out = JSON.parse(surfaced.stdout);
+    expect(out.intent).toBe(DEFAULT_RECORD_DIR);
+    expect(out.candidates).toHaveLength(1);
+    expect(out.candidates[0].summary).toContain("existing auth module");
+  }, TIMEOUT);
+
+  // ===========================================================================
+  // LEGACY FLAT LAYOUT - a hand-written flat memory_path still degrades
+  // correctly: the phase is extracted right and no crash. Seeds the flat
+  // aidlc-docs/ shape directly (a pre-workspace project awaiting migration).
+  // ===========================================================================
+  test("surface extracts the right phase from a legacy flat memory_path", () => {
+    const pd = mkWorkspaceProject();
+    // Overwrite the runtime-graph with a flat-layout row (no per-intent prefix).
+    const rec = seededRecordDir(pd);
+    writeFileSync(
+      join(rec, "runtime-graph.json"),
+      JSON.stringify({
+        workflow_id: "w1",
+        scope: "feature",
+        started_at: "2026-05-28T08:00:00Z",
+        stages: [
+          {
+            stage_slug: "user-stories",
+            memory_path: "aidlc-docs/inception/user-stories/memory.md",
+          },
+        ],
+      }),
+    );
+    // Seed the diary at the flat path (relative to projectDir, per surface's join).
+    const flatDir = join(pd, "aidlc-docs", "inception", "user-stories");
+    mkdirSync(flatDir, { recursive: true });
+    writeFileSync(join(flatDir, "memory.md"), memoryDiary());
+
+    const s = spawnSync(
+      BUN,
+      [LEARNINGS_TS, "surface", "--slug", "user-stories", "--project-dir", pd],
+      { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" },
+    );
+    expect(s.status).toBe(0);
+    const out = JSON.parse(s.stdout);
+    expect(out.phase).toBe("inception");
+    expect(out.candidates.length).toBe(1);
+  }, TIMEOUT);
+
+  // ===========================================================================
+  // NEVER-COMPILED GRAPH - the §13 ritual runs BEFORE the first command that
+  // compiles runtime-graph.json, so on the first gated stage of a workflow the
+  // graph does not exist yet. surface must recompute the diary path instead of
+  // stranding the mandatory ritual. Deliberately does NOT run compile.
+  // ===========================================================================
+  test("surface recomputes the diary path when runtime-graph.json was never compiled", () => {
+    const pd = mkWorkspaceProject();
+    expect(existsSync(join(seededRecordDir(pd), "runtime-graph.json"))).toBe(false);
+    // Seed the diary at the path compile WOULD have recorded, so a wrong
+    // recomputation surfaces zero candidates rather than passing by accident.
+    const diaryDir = join(seededRecordDir(pd), "inception", "user-stories");
+    mkdirSync(diaryDir, { recursive: true });
+    writeFileSync(join(diaryDir, "memory.md"), memoryDiary());
+
+    const s = spawnSync(
+      BUN,
+      [LEARNINGS_TS, "surface", "--slug", "user-stories", "--project-dir", pd],
+      { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" },
+    );
+    expect(s.status, s.stderr).toBe(0);
+    const out = JSON.parse(s.stdout);
+    expect(out.phase).toBe("inception");
+    expect(out.candidates.length).toBe(1);
+    // The recompute is exact and leaves the person nothing to do, so it says
+    // nothing: Codex shows every stderr line, once per stage surfaced.
+    expect(s.stderr).toBe("");
+    // Read-only: surface must not have written the graph it did without.
+    expect(existsSync(join(seededRecordDir(pd), "runtime-graph.json"))).toBe(false);
+  }, TIMEOUT);
+
+  // The recomputed path is not an approximation - it is the same string compile
+  // records, so the ritual reads the same diary either side of the first compile.
+  test("the recomputed diary path is byte-identical to the compiled memory_path", () => {
+    const pd = mkWorkspaceProject();
+    // A diary only at the path compile records: the recompute finds it, so the
+    // two paths are the same string.
+    const recomputed = `${RP}/inception/user-stories/memory.md`;
+    mkdirSync(dirname(join(pd, recomputed)), { recursive: true });
+    writeFileSync(join(pd, recomputed), memoryDiary());
+    const s = spawnSync(
+      BUN,
+      [LEARNINGS_TS, "surface", "--slug", "user-stories", "--project-dir", pd],
+      { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" },
+    );
+    expect(s.status, s.stderr).toBe(0);
+    expect(JSON.parse(s.stdout).candidates.length).toBe(1);
+
+    expect(
+      spawnSync(BUN, [RUNTIME_TS, "--project-dir", pd, "compile"], {
+        timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+        encoding: "utf-8",
+      }).status,
+    ).toBe(0);
+    const graph = JSON.parse(
+      readFileSync(join(seededRecordDir(pd), "runtime-graph.json"), "utf-8"),
+    );
+    const row = graph.stages.find(
+      (st: { stage_slug: string }) => st.stage_slug === "user-stories",
+    );
+    expect(row.memory_path).toBe(recomputed);
+
+    // With the row on disk it wins outright, and the fallback stays quiet.
+    const after = spawnSync(
+      BUN,
+      [LEARNINGS_TS, "surface", "--slug", "user-stories", "--project-dir", pd],
+      { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" },
+    );
+    expect(after.status, after.stderr).toBe(0);
+    expect(after.stderr).toBe("");
+  }, TIMEOUT);
+
+  // A malformed graph is corruption, not absence: it must still fail loudly
+  // rather than being quietly papered over by the recompute path.
+  test("a malformed runtime-graph.json still fails instead of falling back", () => {
+    const pd = mkWorkspaceProject();
+    writeFileSync(join(seededRecordDir(pd), "runtime-graph.json"), "{ not json");
+    const s = spawnSync(
+      BUN,
+      [LEARNINGS_TS, "surface", "--slug", "user-stories", "--project-dir", pd],
+      { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" },
+    );
+    expect(s.status).toBe(1);
+    expect(s.stderr).toContain("runtime-graph.json is malformed");
+  }, TIMEOUT);
+
+  // A recorded row without memory_path is corruption too, not an absent row
+  // that surface can replace with a recomputed path.
+  test("a recorded row without memory_path still fails instead of falling back", () => {
+    const pd = mkWorkspaceProject();
+    writeFileSync(
+      join(seededRecordDir(pd), "runtime-graph.json"),
+      JSON.stringify({
+        workflow_id: "w1",
+        scope: "feature",
+        started_at: "2026-05-28T08:00:00Z",
+        stages: [{ stage_slug: "user-stories" }],
+      }),
+    );
+    const s = spawnSync(
+      BUN,
+      [LEARNINGS_TS, "surface", "--slug", "user-stories", "--project-dir", pd],
+      { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" },
+    );
+    expect(s.status).toBe(1);
+    expect(s.stderr).toContain("has no memory_path in runtime-graph.json");
+  }, TIMEOUT);
+
+  // A guard-rail: the runtime-graph.json must exist where surface reads it (the
+  // seeded record root), proving compile wrote to the per-intent record dir.
+  test("compile writes runtime-graph.json under the per-intent record dir", () => {
+    const pd = mkWorkspaceProject();
+    expect(
+      spawnSync(BUN, [RUNTIME_TS, "--project-dir", pd, "compile"], {
+        timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+        encoding: "utf-8",
+      }).status,
+    ).toBe(0);
+    expect(existsSync(join(seededRecordDir(pd), "runtime-graph.json"))).toBe(true);
+  }, TIMEOUT);
+
+  // Built one Unit at a time, Current Stage waits on the first per-Unit stage.
+  // A later stage is the one that just ran only at a Unit's checkpoint (t342);
+  // with no checkpoint at its approval it is refused.
+  test("built one Unit at a time, a later stage with no checkpoint at its approval is refused", () => {
+    const pd = mkWorkspaceProject();
+    writeFileSync(
+      seededStateFile(pd),
+      "# AI-DLC State Tracking\n- **Current Stage**: functional-design\n- **Scope**: classic\n" +
+        "- **Construction Checkpoints**: enabled\n- **Construction Iteration**: unit-major\n",
+    );
+    const surfaced = spawnSync(
+      BUN,
+      [LEARNINGS_TS, "surface", "--slug", "nfr-requirements", "--project-dir", pd],
+      { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" },
+    );
+    expect(surfaced.status).toBe(1);
+    expect(surfaced.stderr).toContain('slug mismatch: requested "nfr-requirements" but Current Stage is "functional-design"');
+  }, TIMEOUT);
+
+  // The ritual's two commands, run the way an agent got them wrong live: the
+  // refusal names the value to pass, so the next attempt is the right one.
+  test("a wrong --slug or a learnings --checkpoint is refused with the way to run it", () => {
+    const pd = mkWorkspaceProject();
+    const recordName = seededRecordDir(pd).split("/").pop() as string;
+    const surfaced = spawnSync(
+      BUN,
+      [LEARNINGS_TS, "surface", "--slug", recordName, "--project-dir", pd],
+      { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" },
+    );
+    expect(surfaced.status).toBe(1);
+    expect(surfaced.stderr).toContain(`slug mismatch: requested "${recordName}" but Current Stage is "user-stories"`);
+    expect(surfaced.stderr).toContain("Run it again with --slug user-stories.");
+
+    // Another stage's slug, or a Current Stage that is no stage, gets the
+    // plain refusal: neither names a value to retry with.
+    const surface = (slug: string) => spawnSync(
+      BUN,
+      [LEARNINGS_TS, "surface", "--slug", slug, "--project-dir", pd],
+      { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" },
+    );
+    const otherStage = surface("code-generation");
+    expect(otherStage.status).toBe(1);
+    expect(otherStage.stderr).toContain('slug mismatch: requested "code-generation" but Current Stage is "user-stories"');
+    expect(otherStage.stderr).not.toContain("Run it again");
+    writeFileSync(
+      seededStateFile(pd),
+      "# AI-DLC State Tracking\n- **Current Stage**: user-stories; touch x\n- **Scope**: feature\n",
+    );
+    const notAStage = surface(recordName);
+    expect(notAStage.status).toBe(1);
+    expect(notAStage.stderr).toContain("slug mismatch");
+    expect(notAStage.stderr).not.toContain("Run it again");
+    writeFileSync(
+      seededStateFile(pd),
+      "# AI-DLC State Tracking\n- **Current Stage**: user-stories\n- **Scope**: feature\n",
+    );
+
+    const logged = spawnSync(
+      BUN,
+      [
+        LOG_TS, "decision", "--stage", "user-stories", "--checkpoint", "learnings",
+        "--decision", "Anything to add for next time?", "--options", "Nothing to add,Add a note",
+        "--project-dir", pd,
+      ],
+      { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" },
+    );
+    expect(logged.status).not.toBe(0);
+    expect(`${logged.stdout}${logged.stderr}`).toContain(
+      "The learnings question takes no --checkpoint: run the same command without it.",
+    );
+  }, TIMEOUT);
+});

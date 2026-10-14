@@ -1,0 +1,455 @@
+// covers: scope:classic
+//
+// t-tui-t58-workshop-scope.serial.tui.test.ts — drive the workshop SCOPE-ROUTING
+// journey through a REAL claude TUI and prove that `/aidlc --scope classic` skips the
+// ENTIRE Ideation and Operation phases, runs Inception/Construction at Standard depth
+// with a Standard test strategy, and lands < 30 completed stages — ON DISK + as
+// the workshop facilitator SEES it painted. NET-NEW (not a port of an existing
+// .test.ts): a Pattern-B answer-gate journey authored from the original
+// tests/e2e/t58-workflow-workshop-scope.sh (plan 14), with the
+// rendered-screen value-add ADDED.
+//
+// DISTINCT FROM t-tui-workshop.serial.tui.test.ts: that file drives the practices
+// AFFIRMATION gate (multi-tab Submit -> aidlc-team.md `## Way of Working`); THIS
+// file drives the workshop SCOPE ROUTING contract (which stages run, which are
+// skipped, depth/test-strategy defaults). Different surface, different terminator.
+//
+// WHAT IT PROVES (the .sh's 14 assertions, equal-or-stronger, on the same on-disk
+// surface, PLUS the rendered statusline value-add):
+//   ROUTING IS DATA-DRIVEN (scope-mapping.json `classic`):
+//     - classic has depth "Standard", inherits testStrategy "Standard", and SKIPs every
+//       ideation stage (intent-capture..approval-handoff all SKIP — lines 105 of
+//       scope-mapping.json), EXECUTEs all inception/construction, SKIPs operation.
+//     - state-init (aidlc-utility.ts:2044-2099) writes the FULL stage-progress
+//       block with each ideation slug rendered `- [ ] <slug> — SKIP` (the SKIP
+//       suffix from aidlc-utility.ts:1997), so a SKIP'd ideation stage can NEVER
+//       reach `[x]`; it stays `[ ] … — SKIP`. determineFirstPostInitStage
+//       (:2175) therefore returns reverse-engineering, so the workflow's first
+//       post-init phase is INCEPTION and `- **Lifecycle Phase**: INCEPTION` lands
+//       — Ideation is never entered.
+//   .sh -> DISK ASSERTION MAP (each grep becomes a structured disk read):
+//     #1  state file created                 -> existsSync(aidlc-state.md)
+//     #2  no ideation artifacts              -> <record>/ideation/ absent OR empty
+//     #3  no Ideation stage marked [x]       -> 0 lines match `[x] <ideation-slug>`
+//     #4  Inception stages present in state  -> /reverse-engineering|requirements-analysis/
+//     #5  Construction stages present        -> /code-generation|build-and-test/
+//     #6  Operation stages SKIP-only        -> no `[x] <operation-slug>`; each renders `— SKIP`
+//     #7-9 init stages [x]                    -> `[x] workspace-scaffold|-detection|state-init`
+//     #11 classic scope recorded            -> `- **Scope**: classic`
+//     #12 Depth = Standard                    -> `- **Depth**: Standard`
+//     #13 Test Strategy = Standard             -> `- **Test Strategy**: Standard`
+//     #14 completed < 30                       -> `- **Completed**: N` with N < 30
+//     #15 audit log substantial               -> audit.md > 200 bytes (+ WORKSPACE_INITIALISED)
+//   RENDER (the tui-only value-add the headless .sh / SDK path is blind to):
+//     - the captured pane painted `[AIDLC] INCEPTION` (the workshop went straight
+//       to Inception — Ideation was skipped, visible to the user) and NEVER
+//       `[AIDLC] IDEATION`. This is the rendered proof of the skip the .sh could
+//       only infer from state checkboxes.
+//     - an AskUserQuestion menu painted at least once (the workshop runs gates —
+//       scope-mapping describes it as "Facilitated group session with mandatory
+//       gates") with a NON-PROSE footer (`Enter to select` / `Submit answers`).
+//
+// WHY PATTERN B (answer-gate, NOT Pattern A): `/aidlc --scope classic` does NOT run a
+// one-shot config edit — it starts a workflow that then asks "What would you like
+// to build?" (SKILL.md:337) and runs the workshop's mandatory gates. A Pattern-A
+// "wait + assert" test would HANG on the first menu it does not answer. So we run
+// the shared `answer-gate` primitive (tui-drive.ts cmdAnswerGate): it presses
+// Enter (= the Recommended default) on every menu and TERMINATES on a
+// DETERMINISTIC on-disk signal — here the `Completed` counter crossing into the
+// post-init range (aidlc-state.ts:258/405/472 syncs `- **Completed**:` to the
+// live `[x]` count on every advance). We NEVER wait on rewordable screen prose.
+//
+// SCOPE-CONFIRMATION GATE — verified routing + live-verify guard: `classic` is a
+// KNOWN SCOPE (a key in scope-mapping.json), so SKILL.md routes it through the
+// "known scope" path (:329-339), which does NOT render a scope-confirmation gate
+// (that gate is the FREEFORM-text path, :341-362, "confirmation is mandatory for
+// all freeform inputs"). The explicit `--scope classic` flag outranks the shipped
+// `AWS_AIDLC_DEFAULT_SCOPE: "classic"` setting (which happens to agree), so both
+// routing paths land on
+// Classic without relying on the implicit default. The journey is LLM-mediated,
+// so answer-gate remains a no-op disk-poller when no menu is
+// up (it checks the terminator FIRST each loop — tui-drive.ts:951-959), so the
+// gateless known-scope path is safe too. NET: robust to both routings; the disk
+// terminator is the truth either way. (LIVE-VERIFY RISK: if a future SKILL.md
+// change makes the bare keyword render a scope picker whose default is NOT
+// classic, this would land a different scope — the final `- **Scope**: classic`
+// disk assert would then RED, which is the test doing its job: a FINDING about the
+// routing, never a thing to soften.)
+//
+// COST: spends real Bedrock tokens (a fresh-project state-init turn + the workshop
+// gate sequence into the first post-init Inception stages — minutes of live LLM
+// turns). Gated behind AIDLC_TUI_LIVE=1 so a bare `--e2e` on a laptop SKIPs it;
+// selected TUI substrate/claude/distributable absence also SKIPs with a reason — never a hollow pass.
+//
+// Spawn tui-drive.ts using the shared runtime selector for the native Bun and
+// POSIX tmux backends. The driver subprocess remains the source of the `tui`
+// mechanism evidence.
+
+import { liveCaseTimeoutMs, LIVE_LONG_OPERATION_TIMEOUT_MS, remainingOperationTimeoutMs, remainingCleanupTimeoutMs, fileCleanupReserveMs, NATIVE_TERMINAL_CLEANUP_TIMEOUT_MS, NATIVE_STARTUP_TIMEOUT_MS } from "../harness/test-budget.ts";
+import { beforeEach, describe, expect, test } from "bun:test";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { readAllAuditShards } from "../../dist/claude/.claude/tools/aidlc-lib.ts";
+import { recordDirFor, stateFilePathFor } from "../harness/sdk-drive.ts";
+import {
+  cleanupTuiProjectAfterKill,
+  setupTuiProject,
+} from "../harness/tui-fixtures.ts";
+import { resolveTuiRuntime, tuiUnavailableReason } from "../harness/tui-runtime.ts";
+
+function completedStartupProbe<T extends { error?: Error }>(result: T): T {
+  if ((result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT") throw result.error;
+  return result;
+}
+
+const DRIVER = join(import.meta.dir, "..", "harness", "tui-drive.ts");
+const AIDLC_SRC = join(import.meta.dir, "..", "..", "dist", "claude", ".claude");
+const { bin: DRIVE_BIN, prefix: DRIVE_PREFIX } = resolveTuiRuntime(DRIVER);
+
+// Honour the suite's AIDLC_TEST_TIMEOUT convention (seconds; the integration tier
+// sets 600). A workshop run-through (fresh state-init + several gated post-init
+// stages) is several minutes of real LLM turns, so the bun:test cap is generous.
+const TIMEOUT_S = Number(process.env.AIDLC_TEST_TIMEOUT);
+const TEST_TIMEOUT_MS = Number.isSafeInteger(TIMEOUT_S) && TIMEOUT_S > 0
+  ? TIMEOUT_S * 1000
+  : liveCaseTimeoutMs(LIVE_LONG_OPERATION_TIMEOUT_MS);
+let caseDeadlineMs: number;
+beforeEach(() => { caseDeadlineMs = Date.now() + TEST_TIMEOUT_MS; });
+function remainingWorkMs(): number {
+  return remainingOperationTimeoutMs(TEST_TIMEOUT_MS, {
+    deadlineMs: caseDeadlineMs,
+    reserveMs: fileCleanupReserveMs(TEST_TIMEOUT_MS),
+    phase: "E2E live work",
+  })!;
+}
+function remainingCleanupMs(): number {
+  return remainingCleanupTimeoutMs(NATIVE_TERMINAL_CLEANUP_TIMEOUT_MS, {
+    deadlineMs: caseDeadlineMs,
+    phase: "E2E terminal cleanup",
+  });
+}
+
+
+
+interface Run {
+  rc: number;
+  stdout: string;
+  stderr: string;
+}
+function drive(args: string[]): Run {
+  const res = spawnSync(DRIVE_BIN, [...DRIVE_PREFIX, ...args], { timeout: args[0] === "kill" ? remainingCleanupMs() : remainingWorkMs(), encoding: "utf-8" });
+  return { rc: res.status ?? -1, stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+}
+function waitFor(session: string, pattern: string, timeoutMs: number, stableMs: number): boolean {
+  return (
+    drive([
+      "wait",
+      "--session",
+      session,
+      "--pattern",
+      pattern,
+      "--timeout-ms",
+      String(timeoutMs),
+      "--stable-ms",
+      String(stableMs),
+    ]).rc === 0
+  );
+}
+
+// ABSENT / opt-in gating. The token guard AIDLC_TUI_LIVE=1 is checked FIRST so a
+// bare --e2e (no live opt-in) reports a clear skip reason, not a substrate miss.
+function skipReason(): string | null {
+  if (process.env.AIDLC_TUI_LIVE !== "1") {
+    return "set AIDLC_TUI_LIVE=1 to run the live workshop-scope journey (uses Bedrock tokens)";
+  }
+  const runtimeReason = tuiUnavailableReason();
+  if (runtimeReason) return runtimeReason;
+  if (completedStartupProbe(spawnSync("claude", ["--version"], { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8" })).status !== 0) {
+    return "claude CLI not found";
+  }
+  if (!existsSync(AIDLC_SRC)) return `distributable missing: ${AIDLC_SRC}`;
+  return null;
+}
+const SKIP_REASON = skipReason();
+
+// The 7 ideation slugs (SKILL.md:465-471 stage graph). The classic scope SKIPs
+// EVERY one (scope-mapping.json `classic.stages`), so none may ever be marked
+// `[x]` — the .sh's Test 3 grep, here a per-slug disk read.
+const IDEATION_SLUGS = [
+  "intent-capture",
+  "market-research",
+  "feasibility",
+  "scope-definition",
+  "team-formation",
+  "rough-mockups",
+  "approval-handoff",
+];
+
+// Poll an ON-DISK predicate until true or timeout — the deterministic completion
+// signal. We never gate on the lagging statusline phase flip (it paints `ready`
+// until state-init writes aidlc-state.md, minutes behind the work — the t29
+// lesson). Disk is the truth.
+async function waitForDisk(pred: () => boolean, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + Math.min(timeoutMs, remainingWorkMs());
+  while (Date.now() < deadline) {
+    if (pred()) return true;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  return pred();
+}
+
+// The `- **Completed**: N` counter (aidlc-utility.ts:2071 at init = 3; synced to
+// the live `[x]` count on every advance/skip by aidlc-state.ts:258/405/472).
+// Returns the integer, or -1 if absent/unreadable.
+function completedCount(projectDir: string): number {
+  const statePath = stateFilePathFor(projectDir);
+  if (!existsSync(statePath)) return -1;
+  try {
+    const m = readFileSync(statePath, "utf8").match(/^-\s*\*\*Completed\*\*:\s*(\d+)/m);
+    return m ? Number.parseInt(m[1], 10) : -1;
+  } catch {
+    return -1;
+  }
+}
+
+describe("t-tui-t58 workshop-scope (skips Ideation, runs Inception+ at Standard/Standard)", () => {
+  test.skipIf(SKIP_REASON !== null)(
+    `classic scope routing skips Ideation + lands Inception/Construction/Operation on disk${SKIP_REASON ? ` — SKIP: ${SKIP_REASON}` : ""}`,
+    async () => {
+      const session = `aidlc_tui_t58_${process.pid}`;
+      // --no-aidlc-docs: a brand-new workspace the journey scaffolds itself (the
+      // .sh's `setup_integration_project --no-aidlc-docs`). Use an explicit
+      // `--scope classic` flag so this test exercises the workshop lifecycle,
+      // not the separate scope-confirmation/disambiguation surface.
+      const proj = setupTuiProject({ noAidlcDocs: true });
+      // Render value-add: tail the grid while the workshop runs to prove (a) the
+      // INCEPTION statusline painted (Ideation skipped, as the user sees it) and
+      // never IDEATION, and (b) a gate menu painted with a non-prose footer.
+      let sawInception = false;
+      let sawIdeation = false;
+      let sawMenu = false;
+      let pollTimer: ReturnType<typeof setInterval> | undefined;
+      try {
+        // --- launch the claude TUI + clear the two startup modals ----------------
+        expect(
+          drive([
+            "start",
+            "--session",
+            session,
+            "--cwd",
+            proj,
+            "--width",
+            "120",
+            "--height",
+            "45",
+            "--",
+            "claude",
+            "--dangerously-skip-permissions",
+          ]).rc,
+        ).toBe(0);
+
+        const startup = drive([
+          "startup", "--session", session,
+          "--ready-pattern", "\\[AIDLC\\].*ready", "--timeout-ms", String(remainingWorkMs()),
+        ]);
+        expect(startup.rc).toBe(0);
+        // Fresh project -> the no-workflow `[AIDLC] ready` baseline.
+        expect(waitFor(session, "\\[AIDLC\\].*ready", remainingWorkMs(), 800)).toBe(true);
+
+        // --- submit the workshop command ----------------------------------------
+        // Slash command has spaces -> send literally with no auto-Enter, then a
+        // named Enter. The explicit scope flag avoids the current bare-keyword
+        // confirmation loop; t29 owns the scope-disambiguation surface.
+        drive([
+          "send",
+          "--session",
+          session,
+          "--keys",
+          "/aidlc --scope classic Build a simple task tracker",
+          "--literal",
+          "--no-enter",
+        ]);
+        drive(["send", "--session", session, "--keys", "Enter", "--no-enter"]);
+
+        // Begin tailing the grid BEFORE the answer-gate runs, so we catch the
+        // INCEPTION statusline + any gate menu while the workshop is live. Plain
+        // text only — platform-invariant (no colour escapes).
+        pollTimer = setInterval(() => {
+          const grid = drive(["capture", "--session", session]).stdout;
+          // P9: the statusline carries an orientation prefix ("<intent-slug> · ")
+          // before the phase, so anchor on the "· <PHASE>" separator.
+          if (grid.includes("· INCEPTION")) sawInception = true;
+          if (grid.includes("· IDEATION")) sawIdeation = true;
+          if (grid.includes("Enter to select") || grid.includes("Submit answers")) {
+            sawMenu = true;
+          }
+        }, 1000);
+
+        // --- answer the workshop gates via the shared answer-gate primitive ------
+        // It presses Enter (= the Recommended default) on every menu and TERMINATES
+        // on the DETERMINISTIC disk signal: `- **Completed**:` crossing into the
+        // post-init range. Anchored 5..29 — > the .sh's "init + at least one
+        // post-init" floor and < the .sh's "< 30" ceiling, so the SAME terminator
+        // proves the workshop progressed past Initialization AND respected the
+        // classic scope's 25-EXECUTE cap. answer-gate is a no-op disk-poller if no
+        // menu paints (known-scope path), so this is safe for BOTH routings.
+        const gateRc = await new Promise<number>((resolve) => {
+          const child = spawn(
+            DRIVE_BIN,
+            [
+              ...DRIVE_PREFIX,
+              "answer-gate",
+              "--session",
+              session,
+              "--project-dir",
+              proj,
+              "--until-state-field",
+              "Completed=^([5-9]|[12][0-9])$",
+              // No per-gate timeout: workshop can spend several minutes in real
+              // stage work between menus. The overall timeout is the wedge
+              // backstop; per-gate budgets false-fire on active progress.
+              "--overall-timeout-ms",
+              String(remainingWorkMs()),
+            ],
+            { timeout: remainingWorkMs(), killSignal: "SIGKILL", stdio: "inherit" },
+          );
+          child.on("exit", (code) => resolve(code ?? -1));
+          child.on("error", () => resolve(-1));
+        });
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = undefined;
+
+        // answer-gate's own backstop errors loud on a hang (nonzero exit) — a hang
+        // is a FINDING, never softened. But also confirm the disk terminator
+        // actually landed (defence against a clean-exit race): the Completed
+        // counter must be in [5, 29].
+        const pane = drive(["capture", "--session", session]).stdout;
+        if (gateRc !== 0) {
+          throw new Error(
+            `answer-gate exited ${gateRc} (workshop gates never reached Completed in [5,29]).\n` +
+              `Completed=${completedCount(proj)}\n---- last pane ----\n${pane}\n-------------------`,
+          );
+        }
+        // belt-and-braces: re-poll disk in case the child raced its own exit.
+        const reached = await waitForDisk(() => {
+          const c = completedCount(proj);
+          return c >= 5 && c <= 29;
+        }, remainingWorkMs());
+        expect(reached).toBe(true);
+
+        // ===================== ON DISK (the .sh's 14 assertions) =================
+        const statePath = stateFilePathFor(proj);
+
+        // #1 state file created.
+        expect(existsSync(statePath)).toBe(true);
+        const stateMd = readFileSync(statePath, "utf8");
+
+        // #2 no ideation artifacts: workshop SKIPs all ideation, so the record's
+        //    ideation/ dir is either absent or empty (the .sh's two-branch check).
+        const ideationDir = join(recordDirFor(proj), "ideation");
+        if (existsSync(ideationDir)) {
+          const ideationFiles = walkFiles(ideationDir);
+          expect(ideationFiles.length).toBe(0);
+        }
+
+        // #3 no Ideation stage marked [x]: each SKIP'd ideation slug renders
+        //    `- [ ] <slug> — SKIP` (aidlc-utility.ts:1997) and can never reach
+        //    `[x]`. Assert ZERO `[x] <ideation-slug>` lines (the .sh's grep -ciE).
+        for (const slug of IDEATION_SLUGS) {
+          const reX = new RegExp(`\\[x\\]\\s*${slug}\\b`, "i");
+          if (reX.test(stateMd)) {
+            throw new Error(`ideation stage '${slug}' was marked [x] — classic must SKIP it`);
+          }
+        }
+
+        // #4 Inception stages present in state (the .sh's grep).
+        expect(stateMd).toMatch(/reverse-engineering|requirements-analysis/);
+        // #5 Construction stages present.
+        expect(stateMd).toMatch(/code-generation|build-and-test/);
+        // #6 Operation stages are planned-but-SKIP'd for classic: state-init still
+        //    renders every slug as `- [ ] <slug> — SKIP` (and by number under
+        //    Stages to Skip), so the slugs ARE present. Assert none is marked [x]
+        //    and each carries the SKIP suffix — the same shape as #3 for Ideation.
+        for (const slug of ["deployment-pipeline", "observability-setup"]) {
+          expect(new RegExp(`\\[x\\]\\s*${slug}\\b`, "i").test(stateMd)).toBe(false);
+          expect(stateMd).toMatch(new RegExp(`- \\[[ S]\\] ${slug} \u2014 SKIP`));
+        }
+
+        // #7-9 all 3 init stages marked [x] (the .sh's per-stage grep).
+        for (const stage of ["workspace-scaffold", "workspace-detection", "state-init"]) {
+          expect(new RegExp(`\\[x\\]\\s*${stage}\\b`, "i").test(stateMd)).toBe(true);
+        }
+
+        // #11 classic scope recorded — pin the exact field (stronger than the
+        //     .sh's loose `[Ww]orkshop` grep).
+        expect(stateMd).toMatch(/^-\s*\*\*Scope\*\*:\s*classic$/m);
+
+        // #12 Depth = Standard (classic scope — scope-mapping.json). Pin the
+        //     field (stronger than the .sh's `Depth.*Standard`).
+        expect(stateMd).toMatch(/^-\s*\*\*Depth\*\*:\s*Standard$/m);
+
+        // #13 Test Strategy = Standard (classic inherits from Standard depth).
+        expect(stateMd).toMatch(/^-\s*\*\*Test Strategy\*\*:\s*Standard$/m);
+
+        // #14 completion cannot exceed the 18-stage classic grid.
+        const completed = completedCount(proj);
+        expect(completed).toBeGreaterThanOrEqual(5);
+        expect(completed).toBeLessThanOrEqual(18);
+
+        // #15 audit log exists with substantial content (> 200 bytes), and the
+        //     deterministic state-init emission landed (stronger than the .sh's
+        //     byte-size-only check). Initialization and later stage activity can
+        //     be written by different clone/process shards, so inspect the
+        //     canonical all-shard view rather than whichever shard sorts first.
+        const auditMd = readAllAuditShards(proj);
+        expect(auditMd.length).toBeGreaterThan(200);
+        expect(auditMd).toContain("WORKSPACE_INITIALISED");
+        const wiIdx = auditMd.indexOf("WORKSPACE_INITIALISED");
+        expect(auditMd.slice(wiIdx, wiIdx + 500)).toMatch(/Scope.*:\s*classic/);
+
+        // ===================== RENDER (the tui-only value-add) ===================
+        // The captured pane painted `[AIDLC] INCEPTION` (the workshop went straight
+        // to Inception because Ideation was skipped) and NEVER `[AIDLC] IDEATION` —
+        // the rendered proof of the skip the headless .sh / SDK path cannot see.
+        expect(sawInception).toBe(true);
+        expect(sawIdeation).toBe(false);
+        // A gate menu painted at least once with a non-prose footer (the workshop's
+        // "mandatory gates"). NON-PROSE signals only — never a rewordable string.
+        expect(sawMenu).toBe(true);
+      } finally {
+        if (pollTimer) clearInterval(pollTimer);
+        cleanupTuiProjectAfterKill(
+          proj,
+          session,
+          drive(["kill", "--session", session]),
+        );
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+});
+
+// Recursively collect all FILES under a directory (the .sh's `find <dir> -type f`).
+function walkFiles(dir: string): string[] {
+  const out: string[] = [];
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return out;
+  }
+  for (const e of entries) {
+    const p = join(dir, e);
+    try {
+      if (statSync(p).isDirectory()) {
+        out.push(...walkFiles(p));
+      } else {
+        out.push(p);
+      }
+    } catch {
+      // ignore unreadable entry
+    }
+  }
+  return out;
+}

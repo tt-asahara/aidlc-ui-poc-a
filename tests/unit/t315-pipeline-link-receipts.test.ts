@@ -1,0 +1,1408 @@
+// covers: subcommand:aidlc-log:link, audit:PIPELINE_LINK_COMPLETED, function:codekbStoreIsCurrent, function:codekbSourceRoot, function:latestPipelineLinkArtifactMtime, function:pipelineLinkEvidence, function:currentPipelineLinkReceipts, function:pipelineLinks, function:singleStageAttemptIsOpen, function:checkPipelineLinkEvidence
+//
+// Pipeline links are durable, ordered completion evidence. The log tool owns
+// each receipt; the engine and direct state transitions require the complete
+// current-attempt chain before a pipeline stage can gate or complete.
+
+import {
+  NATIVE_FIXTURE_SETUP_TIMEOUT_MS,
+  NATIVE_STARTUP_TIMEOUT_MS,
+  remainingOperationTimeoutMs,
+} from "../harness/test-budget.ts";
+import { afterEach, describe, expect, test, setDefaultTimeout } from "bun:test";
+import { spawnSync } from "node:child_process";
+import {
+  appendFileSync,
+  linkSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
+import { basename, dirname, join, relative } from "node:path";
+import {
+  AIDLC_SRC,
+  cleanupTestProject,
+  createTestProject,
+  DEFAULT_SPACE,
+  runOrchestrateNext,
+  seedAidlcMemory,
+  seededAuditDir,
+  seededStateFile,
+  seedStateFile,
+} from "../harness/fixtures.ts";
+import { appendAuditEntry } from "../../dist/claude/.claude/tools/aidlc-audit.ts";
+import {
+  codekbRepoName,
+  codekbStoreIsCurrent,
+  codekbScopeFingerprint,
+  currentPipelineLinkReceipts,
+  latestPipelineLinkArtifactMtime,
+  pipelineLinkEvidence,
+  readAllAuditShards,
+  singleStageAttemptIsOpen,
+} from "../../dist/claude/.claude/tools/aidlc-lib.ts";
+
+setDefaultTimeout(NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+const BUN = process.execPath;
+const LOG = join(AIDLC_SRC, "tools", "aidlc-log.ts");
+const STATE = join(AIDLC_SRC, "tools", "aidlc-state.ts");
+const ORCH = join(AIDLC_SRC, "tools", "aidlc-orchestrate.ts");
+const UTILITY = join(AIDLC_SRC, "tools", "aidlc-utility.ts");
+const NATIVE_ORCH = join(
+  import.meta.dir,
+  "../../dist-release/claude/.claude/tools/aidlc-orchestrate.ts",
+);
+const RE_STAGE = "reverse-engineering";
+const LEAD = "aidlc-developer-agent";
+const FINAL = "aidlc-architect-agent";
+const PRODUCES = [
+  "business-overview",
+  "architecture",
+  "code-structure",
+  "api-documentation",
+  "component-inventory",
+  "technology-stack",
+  "dependencies",
+  "code-quality-assessment",
+  "reverse-engineering-timestamp",
+];
+
+const projects: string[] = [];
+afterEach(() => {
+  while (projects.length > 0) cleanupTestProject(projects.pop());
+});
+
+function pipelineProject(): string {
+  const proj = createTestProject();
+  projects.push(proj);
+  seedAidlcMemory(proj);
+  seedStateFile(proj, "state-brownfield-init-done.md");
+  // The fixture scope ships collaborators off, which would collapse the
+  // reverse-engineering pipeline to the developer lead alone and drop the
+  // architect link this suite verifies — including isolated single runs, which
+  // inherit this main-workflow scope. Pin the scope to enterprise (the one
+  // collaborators-on scope) so both links exist on every path.
+  const statePath = seededStateFile(proj);
+  writeFileSync(statePath, readFileSync(statePath, "utf-8").replace(/^- \*\*Scope\*\*: .*/m, "- **Scope**: enterprise"));
+  return proj;
+}
+
+function childEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  delete env.AIDLC_SKIP_ARTIFACT_GUARD;
+  delete env.AIDLC_DISABLE_ENSEMBLE_EVIDENCE;
+  return env;
+}
+
+function runLog(
+  proj: string,
+  link: string,
+  repo?: string,
+  single = false,
+  writeHandoff = true,
+): { rc: number; out: string } {
+  const args = [
+    LOG,
+    "link",
+    "--stage",
+    RE_STAGE,
+    "--link",
+    link,
+    "--project-dir",
+    proj,
+  ];
+  if (repo) args.splice(args.length - 2, 0, "--repo", repo);
+  if (single) args.splice(args.length - 2, 0, "--single");
+  if (link === LEAD) {
+    const artifact = developerHandoffPath(proj, repo);
+    if (writeHandoff) writeDeveloperHandoff(proj, repo);
+    args.splice(
+      args.length - 2,
+      0,
+      "--artifact",
+      relative(proj, artifact),
+    );
+  }
+  const result = spawnSync(BUN, args, {
+    timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+    encoding: "utf-8",
+    env: childEnv(),
+  });
+  return {
+    rc: result.status ?? -1,
+    out: `${result.stdout ?? ""}${result.stderr ?? ""}`,
+  };
+}
+
+function developerHandoffPath(proj: string, repo?: string): string {
+  return join(
+    dirname(seededStateFile(proj)),
+    "inception",
+    RE_STAGE,
+    repo ? `developer-scan-${repo}.md` : "developer-scan.md",
+  );
+}
+
+function writeDeveloperHandoff(proj: string, repo?: string): void {
+  const path = developerHandoffPath(proj, repo);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(
+    path,
+    "## Developer Code Scan Results\n\n### Scan Coverage\n\n- src/\n\n## Handoff Summary\n\nCurrent attempt.\n",
+    "utf-8",
+  );
+}
+
+function state(
+  proj: string,
+  args: string[],
+  evidenceDisabled = false,
+): { rc: number; out: string } {
+  const env = childEnv();
+  env.AIDLC_ALLOW_DIRECT_STATE_TRANSITIONS = "1";
+  env.AIDLC_SKIP_HUMAN_PRESENCE_GUARD = "1";
+  if (evidenceDisabled) env.AIDLC_DISABLE_ENSEMBLE_EVIDENCE = "1";
+  const result = spawnSync(
+    BUN,
+    [STATE, ...args, "--project-dir", proj],
+    { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8", env },
+  );
+  return {
+    rc: result.status ?? -1,
+    out: `${result.stdout ?? ""}${result.stderr ?? ""}`,
+  };
+}
+
+function report(
+  proj: string,
+  args: string[],
+  orchestrator = ORCH,
+): { rc: number; out: string; directive: Record<string, unknown> | null } {
+  const result = spawnSync(
+    BUN,
+    [orchestrator, "report", ...args, "--project-dir", proj],
+    { timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS), encoding: "utf-8", env: childEnv() },
+  );
+  const out = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+  let directive: Record<string, unknown> | null = null;
+  try {
+    directive = JSON.parse((result.stdout ?? "").trim()) as Record<
+      string,
+      unknown
+    >;
+  } catch {
+    // Keep the process output for the assertion that follows.
+  }
+  return { rc: result.status ?? -1, out, directive };
+}
+
+function writeAllCodekbArtifacts(proj: string, repo = basename(proj)): void {
+  const dir = join(proj, "aidlc", "spaces", DEFAULT_SPACE, "codekb", repo);
+  mkdirSync(dir, { recursive: true });
+  for (const name of PRODUCES) {
+    writeFileSync(join(dir, `${name}.md`), `# ${name}\n`);
+  }
+}
+
+function writeCurrentCodekbStore(
+  proj: string,
+  registeredRepo?: string,
+): { repo: string; source: string; store: string; codekb: string } {
+  const repo = registeredRepo ?? basename(proj);
+  const sourceRoot = registeredRepo ? join(proj, registeredRepo) : proj;
+  mkdirSync(join(sourceRoot, "src"), { recursive: true });
+  const init = spawnSync("git", ["init", "-q"], {
+    timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+    cwd: sourceRoot,
+    encoding: "utf-8",
+  });
+  if (init.status !== 0) {
+    throw new Error(`git init failed: ${init.stderr}`);
+  }
+  const source = join(sourceRoot, "src", "app.ts");
+  writeFileSync(source, "export const current = true;\n", "utf-8");
+  const fingerprint = codekbScopeFingerprint(
+    sourceRoot,
+    ["src"],
+    registeredRepo ? [] : ["aidlc"],
+  );
+  if (!fingerprint) throw new Error("could not mint CodeKB scope fingerprint");
+
+  writeAllCodekbArtifacts(proj, repo);
+  const codekb = join(
+    proj,
+    "aidlc",
+    "spaces",
+    DEFAULT_SPACE,
+    "codekb",
+    repo,
+  );
+  writeFileSync(
+    join(codekb, "reverse-engineering-timestamp.md"),
+    `# Reverse Engineering Timestamp
+
+## Scope of Analysis
+
+\`\`\`yaml
+scope_version: 1
+kind: partial
+intent: fixture
+fingerprint: ${fingerprint}
+analyzed:
+  paths:
+    - src
+  components: []
+shallow:
+  paths: []
+\`\`\`
+`,
+    "utf-8",
+  );
+  return {
+    repo,
+    source,
+    store: `aidlc/spaces/${DEFAULT_SPACE}/codekb/${repo}/`,
+    codekb,
+  };
+}
+
+function rewriteIntentRepos(proj: string, repos: string[]): void {
+  const registry = join(
+    proj,
+    "aidlc",
+    "spaces",
+    DEFAULT_SPACE,
+    "intents",
+    "intents.json",
+  );
+  const rows = JSON.parse(readFileSync(registry, "utf-8")) as Array<
+    Record<string, unknown>
+  >;
+  rows[0].repos = repos;
+  writeFileSync(registry, `${JSON.stringify(rows, null, 2)}\n`);
+}
+
+function auditBlock(
+  event: string,
+  timestamp: string,
+  fields: Record<string, string>,
+): string {
+  return [
+    `## ${event}`,
+    `**Timestamp**: ${timestamp}`,
+    `**Event**: ${event}`,
+    ...Object.entries(fields).map(([key, value]) => `**${key}**: ${value}`),
+    "",
+    "---",
+    "",
+  ].join("\n");
+}
+
+describe("t315 pipeline link receipts", () => {
+  test("emits the ordered tool-owned receipt fields", () => {
+    const proj = pipelineProject();
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+
+    const lead = runLog(proj, LEAD);
+    expect(lead.rc).toBe(0);
+    expect(lead.out).toContain('"emitted":"PIPELINE_LINK_COMPLETED"');
+    const final = runLog(proj, FINAL);
+    expect(final.rc).toBe(0);
+
+    const audit = readAllAuditShards(proj);
+    expect(audit).toContain("**Event**: PIPELINE_LINK_COMPLETED");
+    expect(audit).toContain(`**Link**: ${LEAD}`);
+    expect(audit).toContain("**Position**: 1/2");
+    expect(audit).toContain("**Artifact Path**:");
+    expect(audit).toMatch(/\*\*Artifact SHA256\*\*: sha256:[0-9a-f]{64}/);
+    expect(audit).toContain("**Artifact Mtime Ms**:");
+    expect(audit).toContain(`**Link**: ${FINAL}`);
+    expect(audit).toContain("**Position**: 2/2");
+  });
+
+  test("refuses an out-of-order final link and a repeated link", () => {
+    const proj = pipelineProject();
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+
+    const early = runLog(proj, FINAL);
+    expect(early.rc).not.toBe(0);
+    expect(early.out).toContain("out of order");
+
+    expect(runLog(proj, LEAD).rc).toBe(0);
+    const repeated = runLog(proj, LEAD, undefined, false, false);
+    expect(repeated.rc).not.toBe(0);
+    expect(repeated.out).toContain("already completed this attempt");
+  });
+
+  test("a later STAGE_STARTED resets the receipt chain", () => {
+    const proj = pipelineProject();
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+    expect(runLog(proj, LEAD).rc).toBe(0);
+
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+    const staleFinal = runLog(proj, FINAL);
+    expect(staleFinal.rc).not.toBe(0);
+    expect(staleFinal.out).toContain("out of order");
+    expect(runLog(proj, LEAD).rc).toBe(0);
+  });
+
+  test("gate rejection and stage jumps reset the main receipt chain", () => {
+    const boundaries: Array<{
+      event: string;
+      fields: Record<string, string>;
+    }> = [
+      {
+        event: "GATE_REJECTED",
+        fields: { Stage: RE_STAGE, Feedback: "Re-run the analysis" },
+      },
+      {
+        event: "STAGE_JUMPED",
+        fields: { Source: "requirements-analysis", Target: RE_STAGE },
+      },
+    ];
+    for (const boundary of boundaries) {
+      const proj = pipelineProject();
+      appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+      expect(runLog(proj, LEAD).rc).toBe(0);
+      expect(runLog(proj, FINAL).rc).toBe(0);
+
+      appendAuditEntry(boundary.event, boundary.fields, proj);
+      const evidence = pipelineLinkEvidence(proj, {
+        slug: RE_STAGE,
+        lead_agent: LEAD,
+        support_agents: [FINAL],
+      });
+      expect(evidence.receipts).toEqual([]);
+      expect(runLog(proj, FINAL).out).toContain("out of order");
+    }
+  });
+
+  for (const [evidenceFile, boundaryFile] of [
+    ["aaaa-evidence.md", "zzzz-boundary.md"],
+    ["zzzz-evidence.md", "aaaa-boundary.md"],
+  ]) {
+    test(`same-second cross-shard boundaries invalidate receipts and reuse (${evidenceFile})`, () => {
+      const proj = pipelineProject();
+      rewriteIntentRepos(proj, ["repo-a", "repo-b"]);
+      const auditDir = seededAuditDir(proj);
+      mkdirSync(auditDir, { recursive: true });
+      const prior = "2026-08-25T19:59:59Z";
+      const tied = "2026-08-25T20:00:00Z";
+      writeFileSync(
+        join(auditDir, evidenceFile),
+        [
+          "# AI-DLC Audit Log\n",
+          auditBlock("STAGE_STARTED", prior, {
+            Stage: RE_STAGE,
+            Agent: LEAD,
+          }),
+          auditBlock("ARTIFACT_REUSED", tied, {
+            Stage: RE_STAGE,
+            Decision: "keep",
+            Artifacts: `aidlc/spaces/${DEFAULT_SPACE}/codekb/repo-a/`,
+            Repo: "repo-a",
+          }),
+          auditBlock("PIPELINE_LINK_COMPLETED", tied, {
+            Stage: RE_STAGE,
+            Link: LEAD,
+            Position: "1/2",
+            Repo: "repo-b",
+          }),
+          auditBlock("PIPELINE_LINK_COMPLETED", tied, {
+            Stage: RE_STAGE,
+            Link: FINAL,
+            Position: "2/2",
+            Repo: "repo-b",
+          }),
+        ].join(""),
+        "utf-8",
+      );
+      writeFileSync(
+        join(auditDir, boundaryFile),
+        [
+          "# AI-DLC Audit Log\n",
+          auditBlock("GATE_REJECTED", tied, {
+            Stage: RE_STAGE,
+            Feedback: "Revise every repository",
+          }),
+        ].join(""),
+        "utf-8",
+      );
+
+      expect(currentPipelineLinkReceipts(proj, RE_STAGE)).toEqual([]);
+      const evidence = pipelineLinkEvidence(proj, {
+        slug: RE_STAGE,
+        lead_agent: LEAD,
+        support_agents: [FINAL],
+      });
+      expect(evidence.receipts).toEqual([]);
+      expect(evidence.reusedRepos).toEqual([]);
+      expect(evidence.missing).toEqual([
+        { link: LEAD, repo: "repo-a" },
+        { link: FINAL, repo: "repo-a" },
+        { link: LEAD, repo: "repo-b" },
+        { link: FINAL, repo: "repo-b" },
+      ]);
+    });
+  }
+
+  for (const [startedFile, completedFile] of [
+    ["aaaa-started.md", "zzzz-completed.md"],
+    ["zzzz-started.md", "aaaa-completed.md"],
+  ]) {
+    test(`same-second cross-shard isolated lifecycle is not considered open (${startedFile})`, () => {
+      const proj = pipelineProject();
+      const auditDir = seededAuditDir(proj);
+      mkdirSync(auditDir, { recursive: true });
+      const tied = "2026-08-25T20:00:00Z";
+      const workflow = `single-stage:${RE_STAGE}`;
+      writeFileSync(
+        join(auditDir, startedFile),
+        [
+          "# AI-DLC Audit Log\n",
+          auditBlock("STAGE_STARTED", tied, {
+            Stage: RE_STAGE,
+            Agent: LEAD,
+            Workflow: workflow,
+          }),
+        ].join(""),
+        "utf-8",
+      );
+      writeFileSync(
+        join(auditDir, completedFile),
+        [
+          "# AI-DLC Audit Log\n",
+          auditBlock("STAGE_COMPLETED", tied, {
+            Stage: RE_STAGE,
+            Details: "Ambiguous completion",
+            Workflow: workflow,
+          }),
+        ].join(""),
+        "utf-8",
+      );
+
+      expect(singleStageAttemptIsOpen(proj, RE_STAGE)).toBe(false);
+    });
+  }
+
+  for (const [higherMtimeFile, lowerMtimeFile] of [
+    ["aaaa-higher-mtime.md", "zzzz-lower-mtime.md"],
+    ["zzzz-higher-mtime.md", "aaaa-lower-mtime.md"],
+  ]) {
+    test(`prior artifact mtime uses the cross-shard maximum across attempts (${higherMtimeFile})`, () => {
+      const proj = pipelineProject();
+      const auditDir = seededAuditDir(proj);
+      mkdirSync(auditDir, { recursive: true });
+      const prior = "2026-08-25T19:59:59Z";
+      const current = "2026-08-25T20:00:00Z";
+      const receipt = (mtime: string) =>
+        auditBlock("PIPELINE_LINK_COMPLETED", prior, {
+          Stage: RE_STAGE,
+          Link: LEAD,
+          Position: "1/2",
+          "Artifact Mtime Ms": mtime,
+        });
+      writeFileSync(
+        join(auditDir, higherMtimeFile),
+        `# AI-DLC Audit Log\n${receipt("200")}`,
+        "utf-8",
+      );
+      writeFileSync(
+        join(auditDir, lowerMtimeFile),
+        `# AI-DLC Audit Log\n${receipt("100")}`,
+        "utf-8",
+      );
+      writeFileSync(
+        join(auditDir, "current-attempt.md"),
+        [
+          "# AI-DLC Audit Log\n",
+          auditBlock("STAGE_STARTED", current, {
+            Stage: RE_STAGE,
+            Agent: LEAD,
+          }),
+        ].join(""),
+        "utf-8",
+      );
+
+      expect(
+        latestPipelineLinkArtifactMtime(proj, RE_STAGE, LEAD, null),
+      ).toBe(200);
+    });
+  }
+
+  test("rejection cannot mint a fresh developer receipt from the stale handoff", () => {
+    const proj = pipelineProject();
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+    expect(runLog(proj, LEAD).rc).toBe(0);
+    expect(runLog(proj, FINAL).rc).toBe(0);
+
+    appendAuditEntry(
+      "GATE_REJECTED",
+      { Stage: RE_STAGE, Feedback: "Rescan" },
+      proj,
+    );
+    const stale = runLog(proj, LEAD, undefined, false, false);
+    expect(stale.rc).not.toBe(0);
+    expect(stale.out).toMatch(
+      /not written in the current stage attempt|not rewritten after its prior pipeline receipt/,
+    );
+
+    expect(runLog(proj, LEAD).rc).toBe(0);
+  });
+
+  test.each(["source", "native"] as const)(
+    "a targeted CodeKB revision needs fresh pipeline work after rejection (t139, %s)",
+    (transport) => {
+      const proj = pipelineProject();
+      const orchestrator = transport === "native" ? NATIVE_ORCH : ORCH;
+      const nextCommand = transport === "native"
+        ? "aidlc engine orchestrate next"
+        : "bun .claude/tools/aidlc-orchestrate.ts next";
+      const linkCommand = transport === "native"
+        ? "aidlc engine log link"
+        : "bun .claude/tools/aidlc-log.ts link";
+      const feedback = "Add a Persistence Design (Target State) section to architecture.md.";
+      writeAllCodekbArtifacts(proj);
+      expect(state(proj, ["checkbox", `${RE_STAGE}=in-progress`]).rc).toBe(0);
+      appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+      expect(runLog(proj, LEAD).rc).toBe(0);
+      expect(runLog(proj, FINAL).rc).toBe(0);
+      expect(report(proj, ["--stage", RE_STAGE, "--result", "awaiting-approval"], orchestrator).directive?.kind).toBe("print");
+
+      const rejected = report(proj, [
+        "--stage", RE_STAGE, "--result", "rejected",
+        "--user-input", "Request Changes", "--reason", feedback,
+      ], orchestrator);
+      expect(rejected.directive?.kind).toBe("print");
+      expect(rejected.directive?.message).toContain(nextCommand);
+      expect(rejected.directive?.message).toContain("dispatch every missing link");
+
+      // Replay the live failure: the conductor edits only the final artifact,
+      // then tries to re-certify the developer's pre-rejection handoff.
+      appendFileSync(
+        join(proj, "aidlc", "spaces", DEFAULT_SPACE, "codekb", basename(proj), "architecture.md"),
+        "\n## Persistence Design (Target State)\n\nHydrate on mount; persist on change.\n",
+      );
+      const revisedTooEarly = report(proj, ["--stage", RE_STAGE, "--result", "revised"], orchestrator);
+      expect(revisedTooEarly.directive?.kind).toBe("error");
+      expect(revisedTooEarly.out).toContain("pipeline handoffs have not been recorded");
+      expect(revisedTooEarly.out).toContain("dispatch the missing pipeline links");
+      expect(revisedTooEarly.directive?.message).toContain(nextCommand);
+      expect(revisedTooEarly.directive?.message).toContain(linkCommand);
+      expect(revisedTooEarly.out).not.toContain("AIDLC_DISABLE_ENSEMBLE_EVIDENCE=1");
+      const staleDeveloper = runLog(proj, LEAD, undefined, false, false);
+      expect(staleDeveloper.rc).not.toBe(0);
+      expect(staleDeveloper.out).toMatch(
+        /not written in the current stage attempt|not rewritten after its prior pipeline receipt/,
+      );
+      expect(runLog(proj, FINAL).out).toContain("out of order");
+
+      const next = runOrchestrateNext(orchestrator, proj, [], { env: childEnv() });
+      expect(next.directive?.kind).toBe("run-stage");
+      expect(next.directive?.pipeline).toEqual({
+        links: [LEAD, FINAL],
+        completed: [],
+      });
+      // Simulate fresh developer work and its architect successor, retaining
+      // the real logger's current-attempt, file-identity and ordering checks.
+      expect(runLog(proj, LEAD).rc).toBe(0);
+      expect(runLog(proj, FINAL).rc).toBe(0);
+      expect(report(proj, ["--stage", RE_STAGE, "--result", "revised"], orchestrator).directive?.kind).toBe("print");
+      expect(report(proj, [
+        "--stage", RE_STAGE, "--result", "approved", "--user-input", "Approve",
+      ], orchestrator).directive?.kind).toBe("done");
+      expect(readFileSync(seededStateFile(proj), "utf8")).toContain("- **Revision Count**: 1");
+    },
+  );
+
+  test("developer handoffs reject symlinks when minting and verifying receipts", () => {
+    const proj = pipelineProject();
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+    const handoff = developerHandoffPath(proj);
+    const external = join(proj, "outside-developer-scan.md");
+    mkdirSync(dirname(handoff), { recursive: true });
+    writeFileSync(external, "External scan.\n");
+    symlinkSync(external, handoff);
+
+    const refused = runLog(proj, LEAD, undefined, false, false);
+    expect(refused.rc).not.toBe(0);
+    expect(refused.out).toContain("no symlink path components");
+
+    unlinkSync(handoff);
+    writeDeveloperHandoff(proj);
+    expect(runLog(proj, LEAD, undefined, false, false).rc).toBe(0);
+    expect(runLog(proj, FINAL).rc).toBe(0);
+    const receiptMtime = statSync(handoff).mtimeMs;
+    const receiptBytes = readFileSync(handoff);
+    unlinkSync(handoff);
+    writeFileSync(external, receiptBytes);
+    const matchedTime = new Date(receiptMtime);
+    utimesSync(external, matchedTime, matchedTime);
+    symlinkSync(external, handoff);
+
+    const evidence = pipelineLinkEvidence(proj, {
+      slug: RE_STAGE,
+      lead_agent: LEAD,
+      support_agents: [FINAL],
+    });
+    expect(evidence.receipts).toEqual([]);
+    expect(evidence.completed).toEqual([]);
+
+    const parentProj = pipelineProject();
+    appendAuditEntry(
+      "STAGE_STARTED",
+      { Stage: RE_STAGE, Agent: LEAD },
+      parentProj,
+    );
+    const parentHandoff = developerHandoffPath(parentProj);
+    const externalDir = join(parentProj, "outside-reverse-engineering");
+    mkdirSync(externalDir, { recursive: true });
+    writeFileSync(
+      join(externalDir, "developer-scan.md"),
+      "External parent redirect.\n",
+    );
+    mkdirSync(dirname(dirname(parentHandoff)), { recursive: true });
+    rmSync(dirname(parentHandoff), { recursive: true, force: true });
+    symlinkSync(externalDir, dirname(parentHandoff), "dir");
+
+    const parentRefused = runLog(
+      parentProj,
+      LEAD,
+      undefined,
+      false,
+      false,
+    );
+    expect(parentRefused.rc).not.toBe(0);
+    expect(parentRefused.out).toContain("no symlink path components");
+  });
+
+  test("post-receipt handoff edits invalidate the whole downstream chain", () => {
+    const proj = pipelineProject();
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+    expect(runLog(proj, LEAD).rc).toBe(0);
+    expect(
+      latestPipelineLinkArtifactMtime(
+        proj,
+        RE_STAGE,
+        LEAD,
+        null,
+      ),
+    ).toBe(statSync(developerHandoffPath(proj)).mtimeMs);
+    expect(runLog(proj, FINAL).rc).toBe(0);
+
+    const handoff = developerHandoffPath(proj);
+    const receiptMtime = statSync(handoff).mtimeMs;
+    appendFileSync(handoff, "\nPost-receipt edit.\n");
+    const evidence = pipelineLinkEvidence(proj, {
+      slug: RE_STAGE,
+      lead_agent: LEAD,
+      support_agents: [FINAL],
+    });
+    expect(evidence.receipts).toEqual([]);
+    expect(evidence.completed).toEqual([]);
+    expect(evidence.missing).toEqual([
+      { link: LEAD, repo: null },
+      { link: FINAL, repo: null },
+    ]);
+
+    writeDeveloperHandoff(proj);
+    const rewrittenAt = new Date(receiptMtime + 1_000);
+    utimesSync(handoff, rewrittenAt, rewrittenAt);
+    expect(pipelineLinkEvidence(proj, {
+      slug: RE_STAGE,
+      lead_agent: LEAD,
+      support_agents: [FINAL],
+    }).receipts).toEqual([]);
+
+    expect(runLog(proj, LEAD, undefined, false, false).rc).toBe(0);
+    expect(pipelineLinkEvidence(proj, {
+      slug: RE_STAGE,
+      lead_agent: LEAD,
+      support_agents: [FINAL],
+    }).completed).toEqual([LEAD]);
+    expect(runLog(proj, FINAL).rc).toBe(0);
+    expect(pipelineLinkEvidence(proj, {
+      slug: RE_STAGE,
+      lead_agent: LEAD,
+      support_agents: [FINAL],
+    }).completed).toEqual([LEAD, FINAL]);
+  });
+
+  // Under Guard Policy relaxed or off, a targeted fix after Request Changes, or
+  // a handoff edited, copied or cloned, keeps the scan the agents already did.
+  function offPipelineProject(): string {
+    const proj = pipelineProject();
+    const statePath = seededStateFile(proj);
+    const content = readFileSync(statePath, "utf-8");
+    const line = "- **Guard Policy**: off (from scope enterprise)";
+    writeFileSync(
+      statePath,
+      /^- \*\*(Change Control|Guard Policy)\*\*: .*/m.test(content)
+        ? content.replace(/^- \*\*(Change Control|Guard Policy)\*\*: .*/m, line)
+        : content.replace(/^(- \*\*Scope\*\*: .*)$/m, `$1\n${line}`),
+    );
+    return proj;
+  }
+  const RE_NODE = { slug: RE_STAGE, lead_agent: LEAD, support_agents: [FINAL] };
+
+  test("under Guard Policy off, Request Changes keeps the earlier scan's handoffs", () => {
+    const proj = offPipelineProject();
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+    expect(runLog(proj, LEAD).rc).toBe(0);
+    expect(runLog(proj, FINAL).rc).toBe(0);
+    appendAuditEntry("GATE_REJECTED", { Stage: RE_STAGE, Feedback: "rename module X in the architecture doc" }, proj);
+    expect(pipelineLinkEvidence(proj, RE_NODE).completed).toEqual([LEAD, FINAL]);
+  });
+
+  test("under Guard Policy off, an edited handoff keeps its link", () => {
+    const proj = offPipelineProject();
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+    expect(runLog(proj, LEAD).rc).toBe(0);
+    expect(runLog(proj, FINAL).rc).toBe(0);
+    appendFileSync(developerHandoffPath(proj), "\nThe person's own note.\n");
+    expect(pipelineLinkEvidence(proj, RE_NODE).completed).toEqual([LEAD, FINAL]);
+  });
+
+  test("gate-start and approve refuse conductor-written artifacts without the final receipt", () => {
+    const proj = pipelineProject();
+    writeAllCodekbArtifacts(proj);
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+    expect(runLog(proj, LEAD).rc).toBe(0);
+
+    const gate = state(proj, ["gate-start", RE_STAGE]);
+    expect(gate.rc).not.toBe(0);
+    expect(gate.out).toContain("pipeline handoffs have not been recorded");
+    expect(gate.out).toContain(FINAL);
+
+    expect(state(proj, ["gate-start", RE_STAGE], true).rc).toBe(0);
+    const approve = state(
+      proj,
+      ["approve", RE_STAGE, "--user-input", "Approve"],
+    );
+    expect(approve.rc).not.toBe(0);
+    expect(approve.out).toContain("pipeline handoffs have not been recorded");
+    expect(readFileSync(seededStateFile(proj), "utf-8")).toContain(
+      `- [?] ${RE_STAGE}`,
+    );
+  });
+
+  test("run-stage resumes with the current-attempt completed link list", () => {
+    const proj = pipelineProject();
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+    expect(runLog(proj, LEAD).rc).toBe(0);
+
+    const result = runOrchestrateNext(ORCH, proj, [], { env: childEnv() });
+    expect(result.status).toBe(0);
+    expect(result.directive?.kind).toBe("run-stage");
+    expect(result.directive?.stage).toBe(RE_STAGE);
+    expect(result.directive?.pipeline).toEqual({
+      links: [LEAD, FINAL],
+      completed: [LEAD],
+    });
+  });
+
+  // A live run on a one-folder project passed the folder's own name as --repo
+  // to every Reverse Engineering command, the name codekb-path gives its store.
+  // The codekb commands took it, the receipt refused it, and the agent renamed
+  // the developer's handoff to recover. The root's name now means the root.
+  test("the project root's own name works as --repo, and its handoff may carry that name", () => {
+    const proj = pipelineProject();
+    const root = codekbRepoName(proj);
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+    for (const args of [
+      ["codekb-scope-diff", "--repo", root],
+      ["codekb-snapshot", "--repo", root, "--paths", "./", "--json"],
+    ]) {
+      const run = spawnSync(BUN, [UTILITY, ...args, "--project-dir", proj], {
+        timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+        encoding: "utf-8",
+        env: childEnv(),
+      });
+      expect(run.status, `${args[0]}: ${run.stdout}${run.stderr}`).toBe(0);
+    }
+    const lead = runLog(proj, LEAD, root);
+    expect(lead.rc, lead.out).toBe(0);
+    expect(lead.out).not.toContain('"repo"');
+    const final = runLog(proj, FINAL, root);
+    expect(final.rc, final.out).toBe(0);
+    const audit = readAllAuditShards(proj);
+    expect(audit).toContain(`developer-scan-${root}.md`);
+    expect(audit).not.toContain("**Repo**:");
+    expect(pipelineLinkEvidence(proj, {
+      slug: RE_STAGE,
+      lead_agent: LEAD,
+      support_agents: [FINAL],
+    }).completed).toEqual([LEAD, FINAL]);
+
+    // The same handoff name with --repo left off, as the agent tried next.
+    const other = pipelineProject();
+    const otherRoot = codekbRepoName(other);
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, other);
+    writeDeveloperHandoff(other, otherRoot);
+    const bare = spawnSync(BUN, [
+      LOG, "link", "--stage", RE_STAGE, "--link", LEAD,
+      "--artifact", relative(other, developerHandoffPath(other, otherRoot)),
+      "--project-dir", other,
+    ], {
+      timeout: remainingOperationTimeoutMs(NATIVE_STARTUP_TIMEOUT_MS),
+      encoding: "utf-8",
+      env: childEnv(),
+    });
+    expect(bare.status, `${bare.stdout}${bare.stderr}`).toBe(0);
+
+    // Any other name is still not this project's repo.
+    const third = pipelineProject();
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, third);
+    const wrong = runLog(third, LEAD, "another-repo");
+    expect(wrong.rc).not.toBe(0);
+    expect(wrong.out).toContain("omit --repo");
+  });
+
+  // A project folder that holds a folder of its own name (a Python package
+  // named after its project) is still one repo: its knowledge base describes
+  // the whole project root, so a change outside that folder makes it stale.
+  test("with no registered repo, the store describes the project root even beside a same-named folder", () => {
+    const proj = pipelineProject();
+    const current = writeCurrentCodekbStore(proj);
+    const child = join(proj, current.repo, "src");
+    mkdirSync(child, { recursive: true });
+    writeFileSync(join(child, "app.ts"), "export const current = true;\n", "utf-8");
+    expect(codekbStoreIsCurrent(proj, current.repo)).toBe(true);
+    writeFileSync(current.source, "export const current = false;\n", "utf-8");
+    expect(codekbStoreIsCurrent(proj, current.repo)).toBe(false);
+    expect(codekbStoreIsCurrent(proj)).toBe(false);
+
+    expect(runOrchestrateNext(
+      ORCH,
+      proj,
+      ["--scope", "bugfix", "--stage", RE_STAGE, "--single"],
+      { env: childEnv() },
+    ).directive?.kind).toBe("run-stage");
+    const reused = state(proj, [
+      "reuse-artifact",
+      RE_STAGE,
+      "--decision",
+      "keep",
+      "--artifacts",
+      current.store,
+      "--repo",
+      current.repo,
+      "--single",
+    ]);
+    expect(reused.rc).not.toBe(0);
+    expect(reused.out).toContain("not CURRENT");
+  });
+
+  test("multi-repo intents enforce one ordered chain per repo", () => {
+    const proj = pipelineProject();
+    rewriteIntentRepos(proj, ["repo-a", "repo-b"]);
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+
+    const missingRepo = runLog(proj, LEAD);
+    expect(missingRepo.rc).not.toBe(0);
+    expect(missingRepo.out).toContain("pass --repo <repo>");
+
+    expect(runLog(proj, LEAD, "repo-a").rc).toBe(0);
+    expect(runLog(proj, FINAL, "repo-a").rc).toBe(0);
+    const earlyB = runLog(proj, FINAL, "repo-b");
+    expect(earlyB.rc).not.toBe(0);
+    expect(earlyB.out).toContain("out of order");
+    expect(runLog(proj, LEAD, "repo-b").rc).toBe(0);
+    expect(runLog(proj, FINAL, "repo-b").rc).toBe(0);
+
+    const audit = readAllAuditShards(proj);
+    expect(audit).toContain("**Repo**: repo-a");
+    expect(audit).toContain("**Repo**: repo-b");
+  });
+
+  test("a reused repo is exempt while the scanned repo still requires its full chain", () => {
+    const proj = pipelineProject();
+    const repos = ["repo-a", "repo-b"];
+    rewriteIntentRepos(proj, repos);
+    writeAllCodekbArtifacts(proj, "repo-a");
+    writeAllCodekbArtifacts(proj, "repo-b");
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+
+    const reused = state(proj, [
+      "reuse-artifact",
+      RE_STAGE,
+      "--decision",
+      "keep",
+      "--artifacts",
+      `aidlc/spaces/${DEFAULT_SPACE}/codekb/repo-a/`,
+      "--repo",
+      "repo-a",
+    ]);
+    expect(reused.rc).toBe(0);
+    expect(reused.out).toContain('"repo":"repo-a"');
+    expect(runLog(proj, LEAD, "repo-b").rc).toBe(0);
+    expect(runLog(proj, FINAL, "repo-b").rc).toBe(0);
+
+    const evidence = pipelineLinkEvidence(proj, {
+      slug: RE_STAGE,
+      lead_agent: LEAD,
+      support_agents: [FINAL],
+    });
+    expect(evidence.reusedRepos).toEqual(["repo-a"]);
+    expect(evidence.missing).toEqual([]);
+    expect(evidence.completed).toEqual([
+      `repo-a:${LEAD}`,
+      `repo-a:${FINAL}`,
+      `repo-b:${LEAD}`,
+      `repo-b:${FINAL}`,
+    ]);
+
+    const next = runOrchestrateNext(ORCH, proj, [], { env: childEnv() });
+    expect(next.directive?.pipeline).toEqual({
+      links: [LEAD, FINAL],
+      completed: evidence.completed,
+    });
+    expect(state(proj, ["gate-start", RE_STAGE]).rc).toBe(0);
+  });
+
+  test("modify and redo decisions never grant a repo reuse exemption", () => {
+    const proj = pipelineProject();
+    const repos = ["repo-a", "repo-b"];
+    rewriteIntentRepos(proj, repos);
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+
+    for (const decision of ["modify", "redo"]) {
+      expect(state(proj, [
+        "reuse-artifact",
+        RE_STAGE,
+        "--decision",
+        decision,
+        "--artifacts",
+        `aidlc/spaces/${DEFAULT_SPACE}/codekb/repo-a/`,
+        "--repo",
+        "repo-a",
+      ]).rc).toBe(0);
+    }
+
+    const evidence = pipelineLinkEvidence(proj, {
+      slug: RE_STAGE,
+      lead_agent: LEAD,
+      support_agents: [FINAL],
+    });
+    expect(evidence.reusedRepos).toEqual([]);
+    expect(evidence.missing).toContainEqual({ link: LEAD, repo: "repo-a" });
+    expect(evidence.missing).toContainEqual({ link: FINAL, repo: "repo-a" });
+  });
+
+  test("--single first-run lifecycle starts before receipts and stays isolated from the main chain", () => {
+    const proj = pipelineProject();
+    const directReport = report(proj, [
+      "--single",
+      "--stage",
+      RE_STAGE,
+      "--result",
+      "completed",
+    ]);
+    expect(directReport.directive?.kind).toBe("error");
+    expect(directReport.out).toContain("no open single-stage");
+
+    const first = runOrchestrateNext(
+      ORCH,
+      proj,
+      ["--scope", "enterprise", "--stage", RE_STAGE, "--single"],
+      { env: childEnv() },
+    );
+    expect(first.status).toBe(0);
+    expect(first.directive?.kind).toBe("run-stage");
+    expect(first.directive?.single).toBe(true);
+    expect(first.directive?.pipeline).toEqual({
+      links: [LEAD, FINAL],
+      completed: [],
+    });
+
+    expect(runLog(proj, LEAD, undefined, true).rc).toBe(0);
+    expect(runLog(proj, FINAL, undefined, true).rc).toBe(0);
+    const resumed = runOrchestrateNext(
+      ORCH,
+      proj,
+      ["--scope", "enterprise", "--stage", RE_STAGE, "--single"],
+      { env: childEnv() },
+    );
+    expect(
+      resumed.directive?.kind,
+      JSON.stringify(resumed.directive),
+    ).toBe("run-stage");
+    expect(resumed.directive?.pipeline).toEqual({
+      links: [LEAD, FINAL],
+      completed: [LEAD, FINAL],
+    });
+    // The close names the code knowledge base in one plain line, and only
+    // when every store the run covers matches the code.
+    writeCurrentCodekbStore(proj);
+    const completed = report(proj, [
+      "--single",
+      "--stage",
+      RE_STAGE,
+      "--result",
+      "completed",
+    ]);
+    expect(completed.directive?.kind).toBe("done");
+    expect(completed.directive?.narration).toBe("The code knowledge base now matches the code.");
+
+    const mainBefore = pipelineLinkEvidence(proj, {
+      slug: RE_STAGE,
+      lead_agent: LEAD,
+      support_agents: [FINAL],
+    });
+    expect(mainBefore.receipts).toEqual([]);
+    expect(mainBefore.missing).toEqual([
+      { link: LEAD, repo: null },
+      { link: FINAL, repo: null },
+    ]);
+
+    appendAuditEntry("STAGE_STARTED", { Stage: RE_STAGE, Agent: LEAD }, proj);
+    expect(runLog(proj, LEAD).rc).toBe(0);
+    expect(runLog(proj, FINAL).rc).toBe(0);
+    const audit = readAllAuditShards(proj);
+    expect(audit).toContain(`**Workflow**: single-stage:${RE_STAGE}`);
+    const singleLifecycle = audit
+      .split("\n---\n")
+      .filter((block) =>
+        block.includes(`**Workflow**: single-stage:${RE_STAGE}`)
+      );
+    expect(
+      singleLifecycle.filter((block) =>
+        block.includes("**Event**: STAGE_STARTED")
+      ),
+    ).toHaveLength(1);
+    expect(
+      singleLifecycle.filter((block) =>
+        block.includes("**Event**: STAGE_COMPLETED")
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("exactly one registered repo stays qualified through isolated routing and receipts", () => {
+    const proj = pipelineProject();
+    rewriteIntentRepos(proj, ["repo-a"]);
+
+    const first = runOrchestrateNext(
+      ORCH,
+      proj,
+      ["--scope", "enterprise", "--stage", RE_STAGE, "--single"],
+      { env: childEnv() },
+    );
+    expect(first.directive?.pipeline).toEqual({
+      links: [LEAD, FINAL],
+      completed: [],
+    });
+    expect(
+      (first.directive?.produces as string[]).every((path) =>
+        path.startsWith(
+          `aidlc/spaces/${DEFAULT_SPACE}/codekb/repo-a/`,
+        )
+      ),
+    ).toBe(true);
+
+    const unqualified = runLog(proj, LEAD, undefined, true);
+    expect(unqualified.rc).not.toBe(0);
+    expect(unqualified.out).toContain("pass --repo <repo>");
+    expect(runLog(proj, LEAD, "repo-a", true).rc).toBe(0);
+    expect(runLog(proj, FINAL, "repo-a", true).rc).toBe(0);
+
+    const resumed = runOrchestrateNext(
+      ORCH,
+      proj,
+      ["--scope", "enterprise", "--stage", RE_STAGE, "--single"],
+      { env: childEnv() },
+    );
+    expect(
+      resumed.directive?.kind,
+      JSON.stringify(resumed.directive),
+    ).toBe("run-stage");
+    expect(resumed.directive?.pipeline).toEqual({
+      links: [LEAD, FINAL],
+      completed: [`repo-a:${LEAD}`, `repo-a:${FINAL}`],
+    });
+    writeAllCodekbArtifacts(proj, "repo-a");
+    expect(report(proj, [
+      "--single",
+      "--stage",
+      RE_STAGE,
+      "--result",
+      "completed",
+    ]).directive?.kind).toBe("done");
+
+    const evidence = pipelineLinkEvidence(proj, {
+      slug: RE_STAGE,
+      lead_agent: LEAD,
+      support_agents: [FINAL],
+    }, { singleRun: true });
+    expect(evidence.repos).toEqual(["repo-a"]);
+    expect(evidence.missing).toEqual([]);
+    const audit = readAllAuditShards(proj);
+    expect(audit).toContain("developer-scan-repo-a.md");
+    expect(audit).toContain("**Repo**: repo-a");
+  });
+
+  test("isolated all-reuse records fresh authority and refuses a stale next attempt", () => {
+    const proj = pipelineProject();
+    const current = writeCurrentCodekbStore(proj);
+    expect(codekbStoreIsCurrent(proj)).toBe(true);
+    expect(runOrchestrateNext(
+      ORCH,
+      proj,
+      ["--scope", "enterprise", "--stage", RE_STAGE, "--single"],
+      { env: childEnv() },
+    ).directive?.kind).toBe("run-stage");
+
+    const reused = state(proj, [
+      "reuse-artifact",
+      RE_STAGE,
+      "--decision",
+      "keep",
+      "--artifacts",
+      current.store,
+      "--single",
+    ]);
+    expect(reused.rc, reused.out).toBe(0);
+    expect(reused.out).toContain('"single":true');
+    const evidence = pipelineLinkEvidence(proj, {
+      slug: RE_STAGE,
+      lead_agent: LEAD,
+      support_agents: [FINAL],
+    }, { singleRun: true });
+    expect(evidence.reusedRepos).toEqual([]);
+    expect(evidence.completed).toEqual([LEAD, FINAL]);
+    expect(evidence.missing).toEqual([]);
+    expect(report(proj, [
+      "--single",
+      "--stage",
+      RE_STAGE,
+      "--result",
+      "completed",
+    ]).directive?.kind).toBe("done");
+    const lateReuse = state(proj, [
+      "reuse-artifact",
+      RE_STAGE,
+      "--decision",
+      "keep",
+      "--artifacts",
+      current.store,
+      "--single",
+    ]);
+    expect(lateReuse.rc).not.toBe(0);
+    expect(lateReuse.out).toContain("run next");
+
+    expect(runOrchestrateNext(
+      ORCH,
+      proj,
+      ["--scope", "enterprise", "--stage", RE_STAGE, "--single"],
+      { env: childEnv() },
+    ).directive?.kind).toBe("run-stage");
+    expect(singleStageAttemptIsOpen(proj, RE_STAGE)).toBe(true);
+    appendFileSync(current.source, "export const changed = true;\n");
+    expect(codekbStoreIsCurrent(proj)).toBe(false);
+    const stale = state(proj, [
+      "reuse-artifact",
+      RE_STAGE,
+      "--decision",
+      "keep",
+      "--artifacts",
+      current.store,
+      "--single",
+    ]);
+    expect(stale.rc).not.toBe(0);
+    expect(stale.out).toContain("is not CURRENT");
+  });
+
+  test("isolated mixed reuse accepts fresh reused repos and links only scanned repos", () => {
+    const proj = pipelineProject();
+    rewriteIntentRepos(proj, ["repo-a", "repo-b"]);
+    const reusedRepo = writeCurrentCodekbStore(proj, "repo-a");
+    writeCurrentCodekbStore(proj, "repo-b");
+    expect(runOrchestrateNext(
+      ORCH,
+      proj,
+      ["--scope", "enterprise", "--stage", RE_STAGE, "--single"],
+      { env: childEnv() },
+    ).directive?.kind).toBe("run-stage");
+
+    expect(state(proj, [
+      "reuse-artifact",
+      RE_STAGE,
+      "--decision",
+      "keep",
+      "--artifacts",
+      reusedRepo.store,
+      "--repo",
+      "repo-a",
+      "--single",
+    ]).rc).toBe(0);
+    expect(runLog(proj, LEAD, "repo-b", true).rc).toBe(0);
+    expect(runLog(proj, FINAL, "repo-b", true).rc).toBe(0);
+
+    const stage = {
+      slug: RE_STAGE,
+      lead_agent: LEAD,
+      support_agents: [FINAL],
+    };
+    expect(pipelineLinkEvidence(proj, stage, {
+      singleRun: true,
+    }).completed).toEqual([
+      `repo-a:${LEAD}`,
+      `repo-a:${FINAL}`,
+      `repo-b:${LEAD}`,
+      `repo-b:${FINAL}`,
+    ]);
+
+    appendFileSync(reusedRepo.source, "export const changed = true;\n");
+    expect(pipelineLinkEvidence(proj, stage, {
+      singleRun: true,
+    }).missing).toEqual([
+      { link: LEAD, repo: "repo-a" },
+      { link: FINAL, repo: "repo-a" },
+    ]);
+    const staleReport = report(proj, [
+      "--single",
+      "--stage",
+      RE_STAGE,
+      "--result",
+      "completed",
+    ]);
+    expect(staleReport.directive?.kind).toBe("error");
+    expect(staleReport.out).toContain(`repo-a:${LEAD}`);
+  });
+
+  test("isolated all-reuse refuses missing, redirected, and invalid required artifacts", () => {
+    const cases = [
+      {
+        artifact: "architecture",
+        mutate: (path: string) => rmSync(path),
+      },
+      {
+        artifact: "dependencies",
+        mutate: (path: string, current: ReturnType<typeof writeCurrentCodekbStore>) => {
+          rmSync(path);
+          linkSync(current.source, path);
+        },
+      },
+      {
+        artifact: "component-inventory",
+        mutate: (path: string) => {
+          rmSync(path);
+          mkdirSync(path);
+        },
+      },
+    ];
+
+    for (const item of cases) {
+      const proj = pipelineProject();
+      const current = writeCurrentCodekbStore(proj);
+      expect(runOrchestrateNext(
+        ORCH,
+        proj,
+        ["--scope", "enterprise", "--stage", RE_STAGE, "--single"],
+        { env: childEnv() },
+      ).directive?.kind).toBe("run-stage");
+      const stateBefore = readFileSync(seededStateFile(proj), "utf-8");
+      item.mutate(join(current.codekb, `${item.artifact}.md`), current);
+
+      const refused = state(proj, [
+        "reuse-artifact",
+        RE_STAGE,
+        "--decision",
+        "keep",
+        "--artifacts",
+        current.store,
+        "--single",
+      ]);
+      expect(refused.rc).not.toBe(0);
+      expect(refused.out).toContain("artifact set is incomplete or invalid");
+      expect(readAllAuditShards(proj)).not.toContain(
+        "**Event**: ARTIFACT_REUSED",
+      );
+      expect(readFileSync(seededStateFile(proj), "utf-8")).toBe(stateBefore);
+
+      appendAuditEntry("ARTIFACT_REUSED", {
+        Stage: RE_STAGE,
+        Decision: "keep",
+        Artifacts: current.store,
+        Workflow: `single-stage:${RE_STAGE}`,
+      }, proj);
+      const forged = report(proj, [
+        "--single",
+        "--stage",
+        RE_STAGE,
+        "--result",
+        "completed",
+      ]);
+      expect(forged.directive?.kind).toBe("error");
+      expect(forged.out).toContain("required CodeKB artifacts");
+      expect(forged.out).toContain(`${item.artifact}.md`);
+      expect(readFileSync(seededStateFile(proj), "utf-8")).toBe(stateBefore);
+    }
+  });
+
+  test("isolated mixed reuse rejects an incomplete reused repo and incomplete scanned repo", () => {
+    const proj = pipelineProject();
+    rewriteIntentRepos(proj, ["repo-a", "repo-b"]);
+    const repoA = writeCurrentCodekbStore(proj, "repo-a");
+    const repoB = writeCurrentCodekbStore(proj, "repo-b");
+    expect(runOrchestrateNext(
+      ORCH,
+      proj,
+      ["--scope", "enterprise", "--stage", RE_STAGE, "--single"],
+      { env: childEnv() },
+    ).directive?.kind).toBe("run-stage");
+    const stateBefore = readFileSync(seededStateFile(proj), "utf-8");
+
+    const missingReused = join(repoA.codekb, "architecture.md");
+    rmSync(missingReused);
+    const refused = state(proj, [
+      "reuse-artifact",
+      RE_STAGE,
+      "--decision",
+      "keep",
+      "--artifacts",
+      repoA.store,
+      "--repo",
+      "repo-a",
+      "--single",
+    ]);
+    expect(refused.rc).not.toBe(0);
+    expect(refused.out).toContain("architecture.md");
+    expect(readFileSync(seededStateFile(proj), "utf-8")).toBe(stateBefore);
+    writeFileSync(missingReused, "# architecture\n", "utf-8");
+    expect(state(proj, [
+      "reuse-artifact",
+      RE_STAGE,
+      "--decision",
+      "keep",
+      "--artifacts",
+      repoA.store,
+      "--repo",
+      "repo-a",
+      "--single",
+    ]).rc).toBe(0);
+    expect(runLog(proj, LEAD, "repo-b", true).rc).toBe(0);
+    expect(runLog(proj, FINAL, "repo-b", true).rc).toBe(0);
+
+    rmSync(join(repoB.codekb, "dependencies.md"));
+    const incompleteScan = report(proj, [
+      "--single",
+      "--stage",
+      RE_STAGE,
+      "--result",
+      "completed",
+    ]);
+    expect(incompleteScan.directive?.kind).toBe("error");
+    expect(incompleteScan.out).toContain("required CodeKB artifacts");
+    expect(incompleteScan.out).toContain(
+      "aidlc/spaces/default/codekb/repo-b/dependencies.md",
+    );
+    expect(readFileSync(seededStateFile(proj), "utf-8")).toBe(stateBefore);
+  });
+
+});
