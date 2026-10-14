@@ -72,3 +72,13 @@ This later checkpoint supersedes the earlier selected-source availability limita
 - B/C remain unmodified. Their pristine official baseline must be pushed before separate feature-branch changes so upstream-versus-treatment changes remain reviewable.
 - An authenticated Git transport is not yet configured for the full-history push. Standard GitHub CLI OAuth requests broader scope than this narrow operation, and safe credential storage is unverified; no login flow was started.
 - Next: establish a suitable authenticated transport and dedicated runtime, verify pristine B/C remote commits/trees first, then create focused feature branches and draft PRs for treatment changes. No merge or successful live A/B/C execution is claimed.
+
+
+## 2026-10-14 — Cloud checkout and access-layer diagnosis
+
+- Created a saved cloud environment configuration for the project. Its first execution attempt stopped during initial repository checkout with a repository-not-found/access error. None of the intended Node, Bun, or Codex checks, or B/C tests, ran in that task.
+- Separately, authenticated repository API access remained functional: A could be read, and both `main` and `feature/ui-poc-foundation` matched their recorded remote commits. API access and the cloud checkout path are separate access layers; success in one does not establish access through the other.
+- Subsequently found an updated saved environment configuration. A second launch request returned a generic backend error; no new execution task was confirmed. This does not establish a successful launch or runtime availability.
+- Rechecked A's existing two branches and PR discussion state before proposing a public-visibility diagnostic. No additional branch or PR discussion content was found at that checkpoint. The visibility diagnostic has not been performed, and A remains private.
+- The checkout failure's underlying cause is unverified. Neither repository code correctness nor a specific credential/configuration defect can be inferred from the access error alone.
+- Next: establish and verify a working checkout path, then resume the pending runtime checks and pristine B/C baseline publication. B/C remain unmodified by this diagnosis. This is an access-diagnosis record, not an A/B/C experiment result; no merge or visibility change is included.
