@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "arm": "A",
+  "source_lock": "ui-poc/treatments/source-lock.json",
+  "installed": [
+    {
+      "repository": "anthropics/skills",
+      "commit": "dbd4588f9e1033efb41dad4bef2f7947c8993d44",
+      "license": "Apache-2.0",
+      "paths": [
+        ".agents/skills/frontend-design/"
+      ]
+    }
+  ],
+  "execution_status": "installed-and-byte-verified; stage-invocation-not-run"
+}
