@@ -7,7 +7,7 @@ user-invocable: true
 
 # Set up AI-DLC A
 
-Treat setup as a reviewable transfer between two checkouts, not as permission to modify a product merely because this skill was invoked.
+Invoke this skill from a Claude Code project rooted at the A checkout that contains it. Treat setup as a reviewable transfer between two checkouts, not as permission to modify a product merely because this skill was invoked.
 
 ## Establish boundaries
 
@@ -60,14 +60,18 @@ Verify that the installed `SKILL.md` and `LICENSE.txt` match the Arm A inventory
 
 ## Install the Claude plugin
 
-In Claude Code, after confirming the marketplace path, project scope, and requested trust/permissions, run:
+Before leaving the A-checkout session, give the user a short handoff containing the resolved absolute `SRC` and `PRODUCT` paths, the exact plugin commands below with `SRC` substituted, and the first verification commands. Do not treat `cd "$PRODUCT"` in a shell tool as changing Claude Code's project.
+
+Open a new Claude Code session with `PRODUCT` as its project/workspace root. In that new session, verify that the host's project root and `git rev-parse --show-toplevel` resolve to `PRODUCT`; stop if either points elsewhere. Continue the handoff from this section even though the source-only `/aidlc-setup` skill is no longer discovered there.
+
+After confirming the marketplace path, project-local scope, and requested trust/permissions in the PRODUCT-rooted session, run:
 
 ```text
 /plugin marketplace add <SRC>/poc/ui-poc/dist/claude
 /plugin install aidlc-ui-poc@aidlc-plugins
 ```
 
-Keep all existing plugin selections. Start a new Claude Code session so the composition hook runs, then check `/plugin list` and `/aidlc --doctor`. Confirm that `ui-poc-comparison` is present and review every compose drop or diagnostic before continuing.
+Keep all existing plugin selections. Start another PRODUCT-rooted Claude Code session so the composition hook runs; recheck the project root, then run `/plugin list` and `/aidlc --doctor`. Confirm that `ui-poc-comparison` is present and review every compose drop or diagnostic before continuing.
 
 ## Stop at rough review by default
 
