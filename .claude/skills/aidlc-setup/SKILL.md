@@ -71,7 +71,7 @@ After confirming the marketplace path, project-local scope, and requested trust/
 /plugin install aidlc-ui-poc@aidlc-plugins
 ```
 
-Keep all existing plugin selections. Start another PRODUCT-rooted Claude Code session so the composition hook runs; recheck the project root, then run `/plugin list` and `/aidlc --doctor`. Confirm that `ui-poc-comparison` is present and review every compose drop or diagnostic before continuing.
+Keep all existing plugin selections. Start another PRODUCT-rooted Claude Code session so the composition hook runs; recheck the project root, then open `/plugin` and inspect its **Installed** tab (or run `claude plugin list` in a shell), followed by `/aidlc --doctor`. This is Claude Code's installed-plugin check, not an AI-DLC engine `plugin list` command. Confirm that `ui-poc-comparison` is present and review every compose drop or diagnostic before continuing.
 
 ## Stop at rough review by default
 
